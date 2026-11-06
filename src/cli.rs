@@ -141,6 +141,10 @@ fn check_passthrough(passthrough: &[String]) -> Result<(bool, Option<String>), S
         if arg == "--" {
             break;
         }
+        // systemd-run stops option parsing at the first non-option (the command).
+        if !arg.starts_with('-') {
+            break;
+        }
         for (flag, why) in [
             ("--slice", "--slice is set by slicewise"),
             ("--system", "--system is not supported"),
@@ -764,6 +768,12 @@ mod tests {
             check_passthrough(&args).unwrap(),
             (true, Some("job.scope".to_string()))
         );
+        // After the command, flags are the command's own arguments.
+        let args: Vec<String> = ["sleep", "--slice=x", "-H"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(check_passthrough(&args).unwrap(), (false, None));
     }
 
     #[test]
