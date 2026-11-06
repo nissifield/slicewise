@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use crate::cgroup::SliceStats;
 use crate::config::{Class, Config};
+use Knob::{CpuQuota, CpuWeight};
+use WriteEvent::{Adopt, Clamp, Unclamp};
 
 pub const QUEUE_CAP: usize = 32;
 pub const RESERVATION_TTL: Duration = Duration::from_secs(300);
@@ -25,6 +27,7 @@ pub struct Snapshot {
     pub protected_cpu_pressure: Vec<f32>,
     /// Working set of each reserved unit present in cgroupfs.
     pub units: BTreeMap<String, u64>,
+    pub adopted: BTreeMap<String, Class>,
 }
 
 impl Snapshot {
@@ -118,6 +121,7 @@ impl Admission {
 pub enum Knob {
     MemoryHigh,
     CpuQuota,
+    CpuWeight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +130,7 @@ pub enum WriteEvent {
     BrakeOff,
     Clamp,
     Unclamp,
+    Adopt,
 }
 
 impl WriteEvent {
@@ -135,6 +140,7 @@ impl WriteEvent {
             WriteEvent::BrakeOff => "brake_off",
             WriteEvent::Clamp => "clamp",
             WriteEvent::Unclamp => "unclamp",
+            WriteEvent::Adopt => "adopt",
         }
     }
 }
@@ -179,6 +185,7 @@ pub struct State {
     pub psi_low_ticks: u32,
     pub last_release: Option<Duration>,
     pub last_observe: Option<Duration>,
+    pub adopted: BTreeMap<String, Class>,
 }
 
 impl State {
@@ -262,9 +269,14 @@ impl State {
                         Knob::CpuQuota => {
                             self.clamp_cpus = write.to.map(|percent| (percent / 100).max(1) as u32);
                         }
+                        Knob::CpuWeight => {}
                     }
-                    if write.event == WriteEvent::BrakeOff {
-                        self.last_release = Some(now);
+                    match write.event {
+                        WriteEvent::Adopt => {
+                            self.adopted.insert(write.slice.clone(), write.class);
+                        }
+                        WriteEvent::BrakeOff => self.last_release = Some(now),
+                        _ => {}
                     }
                 }
                 Action::Admission(admission) => match admission.decision {
@@ -501,52 +513,76 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
 
 fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration) -> Vec<Action> {
     let cpus = cpus(snapshot, config);
-    let batch = Class::Batch;
-    let slice = config.class_slice(batch);
+    let slice = config.class_slice(Class::Batch);
     let pressure = snapshot.cpu_pressure();
-    let mut actions = Vec::new();
-
-    if state.psi_high_ticks >= CLAMP_ENGAGE_TICKS {
+    let step = if state.psi_high_ticks >= CLAMP_ENGAGE_TICKS {
         let next = state.clamp_cpus.unwrap_or(cpus).saturating_sub(1).max(1);
-        if Some(next) != state.clamp_cpus && state.can_write(&slice, now, config) {
+        (Some(next) != state.clamp_cpus).then_some((Clamp, state.clamp_cpus, Some(next)))
+    } else if state.psi_low_ticks >= CLAMP_RELEASE_TICKS {
+        state.clamp_cpus.map(|current| {
+            let next = (current + 1 < cpus).then_some(current + 1);
+            (Unclamp, Some(current), next)
+        })
+    } else {
+        None
+    };
+    let Some((event, from, to)) = step.filter(|_| state.can_write(&slice, now, config)) else {
+        return Vec::new();
+    };
+    let (cmp, threshold, ticks) = match event {
+        Clamp => (">=", config.tuning.cpu_psi_engage, state.psi_high_ticks),
+        _ => ("<=", config.tuning.cpu_psi_release, state.psi_low_ticks),
+    };
+    let reason = format!("cpu pressure {pressure:.1}% {cmp} {threshold}% for {ticks} ticks");
+    let write = Write {
+        event,
+        slice,
+        class: Class::Batch,
+        knob: Knob::CpuQuota,
+        from: from.map(|c| u64::from(c) * 100),
+        to: to.map(|c| u64::from(c) * 100),
+        reason,
+    };
+    // shortcut: k adopted units get N CPUs each, not N in total; upgrade if the soak shows clamps not helping.
+    let mut actions = vec![Action::Write(write.clone())];
+    for (unit, &class) in &state.adopted {
+        if class == Class::Batch && state.can_write(unit, now, config) {
             actions.push(Action::Write(Write {
-                event: WriteEvent::Clamp,
-                slice,
-                class: batch,
-                knob: Knob::CpuQuota,
-                from: state.clamp_cpus.map(|cpus| u64::from(cpus) * 100),
-                to: Some(u64::from(next) * 100),
-                reason: format!(
-                    "cpu pressure {pressure:.1}% >= {}% for {} ticks",
-                    config.tuning.cpu_psi_engage, state.psi_high_ticks
-                ),
-            }));
-        }
-    } else if state.psi_low_ticks >= CLAMP_RELEASE_TICKS
-        && let Some(current) = state.clamp_cpus
-    {
-        let next = if current + 1 >= cpus {
-            None
-        } else {
-            Some(current + 1)
-        };
-        if state.can_write(&slice, now, config) {
-            actions.push(Action::Write(Write {
-                event: WriteEvent::Unclamp,
-                slice,
-                class: batch,
-                knob: Knob::CpuQuota,
-                from: Some(u64::from(current) * 100),
-                to: next.map(|cpus| u64::from(cpus) * 100),
-                reason: format!(
-                    "cpu pressure {pressure:.1}% <= {}% for {} ticks",
-                    config.tuning.cpu_psi_release, state.psi_low_ticks
-                ),
+                slice: unit.clone(),
+                ..write.clone()
             }));
         }
     }
-
     actions
+}
+
+fn adopt(snapshot: &Snapshot, state: &State, config: &Config) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for (unit, &class) in snapshot.adopted.iter().take(32) {
+        if state.adopted.contains_key(unit) {
+            continue;
+        }
+        let weight = Some(u64::from(config.classes.cpu_weight(class).min(100)));
+        actions.push(aw(unit, class, CpuWeight, weight, Adopt));
+        if let Some(cpus) = state.clamp_cpus.filter(|_| class == Class::Batch) {
+            let quota = Some(u64::from(cpus) * 100);
+            actions.push(aw(unit, class, CpuQuota, quota, Clamp));
+        }
+    }
+    actions
+}
+
+fn aw(unit: &str, class: Class, knob: Knob, to: Option<u64>, event: WriteEvent) -> Action {
+    let write = Write {
+        event,
+        slice: unit.into(),
+        class,
+        knob,
+        from: None,
+        to,
+        reason: "adopt".into(),
+    };
+    Action::Write(write)
 }
 
 /// Tick decisions: Rule M, Rule C and the queue head. One batch admission per call.
@@ -558,6 +594,8 @@ pub fn decide(
 ) -> Vec<Action> {
     state.observe(snapshot, config, now);
     state.update_reservations(snapshot, now);
+    let present = &snapshot.adopted;
+    state.adopted.retain(|unit, _| present.contains_key(unit));
     let mut actions = memory_brake(snapshot, state, config, now);
     let batch = config.class_slice(Class::Batch);
     let batch_written = actions.iter().any(|action| {
@@ -566,6 +604,7 @@ pub fn decide(
     if !batch_written {
         actions.extend(cpu_clamp(snapshot, state, config, now));
     }
+    actions.extend(adopt(snapshot, state, config));
     if let Some(request) = state.queue.front() {
         let admission = admission(snapshot, state, config, request, now, true);
         if admission.decision == Decision::Admit {
@@ -1154,6 +1193,7 @@ mod tests {
 
         for sequence in 0..10_000_u32 {
             let mut state = State::default();
+            let adopted_count = (next(&mut lcg) % 4) as usize;
             if sequence % 2 == 0 {
                 state.enqueue(batch_request(2 * GIB));
             }
@@ -1184,6 +1224,11 @@ mod tests {
                 let mem_available = config.system_reserve.0.saturating_add(target);
                 let mut snapshot =
                     make_snapshot(pool_used, mem_available, next(&mut lcg) % (2 * GIB));
+                for n in 0..adopted_count {
+                    snapshot
+                        .adopted
+                        .insert(format!("orch-worker-{n}.scope"), Class::Batch);
+                }
                 snapshot.online_cpus = 2 + (next(&mut lcg) % 7) as u32;
                 snapshot.classes[Class::Interactive.index()] =
                     stats(0, 0, if high { 25.0 } else { 1.0 });
@@ -1191,6 +1236,7 @@ mod tests {
 
                 let actions = decide(&snapshot, &mut state, &config, now);
 
+                let mut grace = std::collections::BTreeSet::new();
                 for write in writes(&actions) {
                     match write.event {
                         WriteEvent::BrakeOff => brake_off += 1,
@@ -1213,9 +1259,17 @@ mod tests {
                     if write.knob == Knob::CpuQuota
                         && let Some(percent) = write.to
                     {
+                        assert_eq!(write.class, Class::Batch, "only batch is clamped");
                         assert!(percent >= 100, "clamp below one CPU");
                     }
-                    if write.event != WriteEvent::BrakeOn {
+                    if write.event == WriteEvent::Adopt {
+                        assert!(
+                            write.to.is_some_and(|w| w <= 100),
+                            "adopted weight above the pool weight"
+                        );
+                        grace.insert(write.slice.clone());
+                        seen.insert(write.slice.clone(), now);
+                    } else if write.event != WriteEvent::BrakeOn && !grace.remove(&write.slice) {
                         if let Some(last) = seen.get(&write.slice) {
                             assert!(
                                 now.saturating_sub(*last) >= Duration::from_secs(10),
@@ -1273,5 +1327,131 @@ mod tests {
             brake_off > 0 && unclamp > 0 && queue_admits > 0,
             "brake_off={brake_off} unclamp={unclamp} queue_admits={queue_admits}"
         );
+    }
+
+    #[test]
+    fn adopt_writes_the_capped_class_weight() {
+        let config = config();
+        let mut state = State::default();
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot
+            .adopted
+            .insert("interactive.scope".into(), Class::Interactive);
+        snapshot
+            .adopted
+            .insert("normal.scope".into(), Class::Normal);
+        snapshot.adopted.insert("batch.scope".into(), Class::Batch);
+
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
+        let adopted: Vec<_> = writes(&actions)
+            .filter(|write| write.event == WriteEvent::Adopt)
+            .collect();
+        assert_eq!(adopted.len(), 3);
+        let weight = |unit: &str| {
+            adopted
+                .iter()
+                .find(|write| write.slice == unit)
+                .and_then(|write| write.to)
+        };
+        assert_eq!(weight("interactive.scope"), Some(100));
+        assert_eq!(weight("normal.scope"), Some(100));
+        assert_eq!(weight("batch.scope"), Some(25));
+    }
+
+    #[test]
+    fn adopt_batch_rides_the_clamp_but_interactive_does_not() {
+        let config = config();
+        let now = Duration::from_secs(2);
+        let mut state = State {
+            clamp_cpus: Some(3),
+            psi_high_ticks: CLAMP_ENGAGE_TICKS,
+            last_observe: Some(now),
+            ..State::default()
+        };
+        for (unit, class) in [
+            ("orch-worker-1.scope", Class::Batch),
+            ("chat.scope", Class::Interactive),
+        ] {
+            state.adopted.insert(unit.to_string(), class);
+        }
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot.classes[Class::Interactive.index()] = stats(0, 0, 25.0);
+        snapshot
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
+        snapshot
+            .adopted
+            .insert("chat.scope".into(), Class::Interactive);
+
+        let actions = decide(&snapshot, &mut state, &config, now);
+        let quota: Vec<_> = writes(&actions)
+            .filter(|write| write.knob == Knob::CpuQuota)
+            .collect();
+        assert!(
+            quota
+                .iter()
+                .any(|write| write.slice == config.class_slice(Class::Batch)
+                    && write.to == Some(200))
+        );
+        assert!(
+            quota
+                .iter()
+                .any(|write| write.slice == "orch-worker-1.scope" && write.to == Some(200))
+        );
+        assert!(!quota.iter().any(|write| write.slice == "chat.scope"));
+    }
+
+    #[test]
+    fn adopt_first_sight_inherits_the_current_clamp() {
+        let config = config();
+        let now = Duration::from_secs(2);
+        let mut state = State {
+            clamp_cpus: Some(2),
+            last_observe: Some(now),
+            ..State::default()
+        };
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
+
+        let actions = decide(&snapshot, &mut state, &config, now);
+        let unit: Vec<_> = writes(&actions)
+            .filter(|write| write.slice == "orch-worker-1.scope")
+            .collect();
+        assert_eq!(unit.len(), 2, "weight plus the current clamp");
+        assert!(
+            unit.iter()
+                .any(|write| write.event == WriteEvent::Adopt && write.to == Some(25))
+        );
+        assert!(
+            unit.iter()
+                .any(|write| write.knob == Knob::CpuQuota && write.to == Some(200))
+        );
+    }
+
+    #[test]
+    fn adopt_tracks_at_most_32_and_forgets_vanished_units() {
+        let config = config();
+        let mut state = State::default();
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        for n in 0..40 {
+            snapshot
+                .adopted
+                .insert(format!("orch-worker-{n}.scope"), Class::Batch);
+        }
+
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
+        let adopted: Vec<_> = writes(&actions)
+            .filter(|write| write.event == WriteEvent::Adopt)
+            .cloned()
+            .collect();
+        assert_eq!(adopted.len(), 32);
+        state.apply(&[Action::Write(adopted[0].clone())], Duration::ZERO);
+        assert_eq!(state.adopted.len(), 1);
+
+        let empty = make_snapshot(0, 8 * GIB, 0);
+        let _ = decide(&empty, &mut state, &config, Duration::from_secs(2));
+        assert!(state.adopted.is_empty(), "a vanished unit is dropped");
     }
 }

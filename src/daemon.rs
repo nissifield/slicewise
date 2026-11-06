@@ -19,8 +19,8 @@ use crate::policy::{
     self, Action, Admission, Decision, Knob, RESERVATION_TTL, Snapshot, State, Write as PolicyWrite,
 };
 use crate::proto::{
-    self, ClassRow, DecisionReply, ErrorCode, Event, Explain, ProtectedRow, Request, Response,
-    Status,
+    self, AdoptedRow, ClassRow, DecisionReply, ErrorCode, Event, Explain, ProtectedRow, Request,
+    Response, Status,
 };
 use crate::systemd::{self, Runner};
 
@@ -56,6 +56,7 @@ pub struct Sampler {
     last_pool: SliceStats,
     last_classes: [SliceStats; 3],
     last_units: BTreeMap<String, u64>,
+    adopt_overflow: bool,
     mem_available: u64,
     online_cpus: u32,
     next_refresh: Duration,
@@ -125,6 +126,7 @@ impl Sampler {
             .iter()
             .map(|protected| self.protected_psi(&root, runner, &protected.unit, refresh))
             .collect();
+        let adopted = self.adopted_units(&root, config);
         let map = units
             .iter()
             .filter_map(|unit| {
@@ -139,7 +141,30 @@ impl Sampler {
             classes: self.last_classes,
             protected_cpu_pressure,
             units: map,
+            adopted,
         }
+    }
+
+    fn adopted_units(&mut self, root: &Path, config: &Config) -> BTreeMap<String, Class> {
+        let pool = self.pool_rel.as_deref().unwrap_or_default();
+        let Some((parent, _)) = pool.rsplit_once('/') else {
+            return BTreeMap::new();
+        };
+        let Ok(present) = cgroup::list_units(root, parent) else {
+            // shortcut: a transient list error forgets adoptions for one tick; upgrade if that churns.
+            self.log_error("adopt", &"cannot list the pool's parent slice");
+            return BTreeMap::new();
+        };
+        let adopted: BTreeMap<_, _> = present
+            .into_iter()
+            .filter_map(|unit| config.adopt_class(&unit).map(|class| (unit, class)))
+            .collect();
+        let overflow = adopted.len() > 32;
+        if overflow && !self.adopt_overflow {
+            self.log_error("adopt", &"too many adopted units");
+        }
+        self.adopt_overflow = overflow;
+        adopted
     }
 
     fn protected_psi(&mut self, root: &Path, runner: &Runner, unit: &str, refresh: bool) -> f32 {
@@ -301,10 +326,11 @@ pub fn tick(
                 let mut daemon = lock(daemon);
                 daemon.state.apply(&[Action::Write(write.clone())], now);
                 log_write(&write);
+                let unit = (!write.slice.ends_with(".slice")).then_some(write.slice.as_str());
                 daemon.push(
                     now,
                     write.event.as_str(),
-                    None,
+                    unit,
                     Some(write.class),
                     &write.reason,
                 );
@@ -340,6 +366,7 @@ fn log_write(write: &PolicyWrite) {
     let knob = match write.knob {
         Knob::MemoryHigh => "MemoryHigh",
         Knob::CpuQuota => "CPUQuota",
+        Knob::CpuWeight => "CPUWeight",
     };
     log::emit(
         "info",
@@ -371,6 +398,11 @@ pub fn status(snapshot: &Snapshot, state: &State, config: &Config, now: Duration
             .iter()
             .map(|&class| class_row(class, snapshot, state, config, now))
             .collect(),
+        adopted: state
+            .adopted
+            .iter()
+            .map(|(unit, &class)| adopted_row(unit, class, state))
+            .collect(),
         protected: config
             .protected
             .iter()
@@ -381,6 +413,15 @@ pub fn status(snapshot: &Snapshot, state: &State, config: &Config, now: Duration
             })
             .collect(),
         queue: state.queue.len(),
+    }
+}
+
+fn adopted_row(unit: &str, class: Class, state: &State) -> AdoptedRow {
+    let cpus = state.clamp_cpus.filter(|_| class == Class::Batch);
+    AdoptedRow {
+        unit: unit.into(),
+        class,
+        cpu_quota: cpus.map(|c| u64::from(c) * 100),
     }
 }
 
@@ -772,10 +813,16 @@ mod tests {
         snapshot.pool.memory_current = 2 << 30;
         snapshot.classes[Class::Batch.index()].memory_current = 1 << 30;
         snapshot.classes[Class::Batch.index()].pids_current = 3;
-        let state = State {
+        snapshot
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
+        let mut state = State {
             clamp_cpus: Some(2),
             ..State::default()
         };
+        state
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
         let status = status(&snapshot, &state, &config, Duration::from_secs(5));
         assert_eq!(status.cap, 8 << 30);
         assert_eq!(status.working_set, 2 << 30);
@@ -787,6 +834,10 @@ mod tests {
         assert_eq!(batch.memory_high, None);
         assert_eq!(batch.cpu_quota, Some(200));
         assert_eq!(status.classes[Class::Normal.index()].cpu_quota, None);
+        assert_eq!(status.adopted.len(), 1);
+        assert_eq!(status.adopted[0].unit, "orch-worker-1.scope");
+        assert_eq!(status.adopted[0].class, Class::Batch);
+        assert_eq!(status.adopted[0].cpu_quota, Some(200));
         assert_eq!(status.queue, 0);
     }
 }

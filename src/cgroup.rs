@@ -138,6 +138,16 @@ pub fn slice_stats(root: &Path, rel: &str) -> io::Result<SliceStats> {
     })
 }
 
+/// `*.scope` and `*.service` entries directly under `rel`; the adopt candidates (design §6.3).
+pub fn list_units(root: &Path, rel: &str) -> io::Result<Vec<String>> {
+    let mut units: Vec<String> = fs::read_dir(path(root, rel))?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".scope") || name.ends_with(".service"))
+        .collect();
+    units.sort();
+    Ok(units)
+}
+
 pub fn mem_total_bytes(proc_root: &Path) -> io::Result<u64> {
     let text = fs::read_to_string(proc_root.join("meminfo"))?;
     parse_meminfo_bytes(&text)
@@ -233,5 +243,15 @@ mod tests {
             Some("/user.slice/user@$UID.service")
         );
         assert_eq!(parse_proc_cgroup(""), None);
+    }
+
+    #[test]
+    fn list_units_keeps_scope_and_service_only() {
+        let dir = std::env::temp_dir().join(format!("slicewise-list-{}", std::process::id()));
+        for name in ["b.service", "a.scope", "c.slice", "d.txt"] {
+            fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        assert_eq!(list_units(&dir, "").unwrap(), ["a.scope", "b.service"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

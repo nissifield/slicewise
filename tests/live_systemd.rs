@@ -90,6 +90,15 @@ fn cpu_max(unit: &str) -> String {
         .unwrap_or_default()
 }
 
+fn cpu_weight(unit: &str) -> String {
+    let rel = show(unit, "ControlGroup");
+    if rel.is_empty() {
+        return String::new();
+    }
+    cgroup::read_trimmed(Path::new(cgroup::CGROUP_ROOT), &format!("{rel}/cpu.weight"))
+        .unwrap_or_default()
+}
+
 struct Fixture {
     pool: String,
     classes: [String; 3],
@@ -126,7 +135,7 @@ impl Fixture {
         fs::write(
             config_dir.join("config.toml"),
             format!(
-                "pool_slice = \"{pool}\"\nsystem_reserve = \"256M\"\nmem_per_job = \"256M\"\nreserve_cpus = 1\n"
+                "pool_slice = \"{pool}\"\nsystem_reserve = \"256M\"\nmem_per_job = \"256M\"\nreserve_cpus = 1\n\n[[adopt]]\nmatch = \"{MARK}-worker-*.scope\"\nclass = \"batch\"\n"
             ),
         )
         .expect("write config");
@@ -464,4 +473,61 @@ fn daemon_serves_run_explain_reset_and_stop_post() {
         cpu_max(&fixture.classes[2])
     );
     println!("RESULT live_systemd PASS unit={unit} batch={batch}");
+}
+
+#[test]
+#[ignore]
+fn adopted_scope_reverts_after_daemon_kill() {
+    if skip("adopted_scope_reverts_after_daemon_kill") {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.assert_config();
+    fixture.install_units();
+    fixture.start_service_daemon();
+
+    // A scope started outside the wrapper lands in app.slice and is adopted as batch.
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let scope_job = format!("{MARK}-worker-{}-{n}", std::process::id());
+    let scope = format!("{scope_job}.scope");
+    let unit_arg = format!("--unit={scope_job}");
+    fixture.jobs.push(scope.clone());
+    let mut scope_run = fixture
+        .command("systemd-run")
+        .args(["--user", "--scope", &unit_arg, "sleep", "120"])
+        .spawn()
+        .expect("spawn adopted scope");
+    wait_value(Duration::from_secs(5), || {
+        let rel = show(&scope, "ControlGroup");
+        (!rel.is_empty()).then_some(rel)
+    })
+    .expect("adopted scope cgroup did not appear");
+    assert!(
+        wait_for(Duration::from_secs(10), || cpu_weight(&scope) == "25"),
+        "scope was not adopted: cpu.weight={}",
+        cpu_weight(&scope)
+    );
+
+    mutate(&[
+        "--user",
+        "kill",
+        "--signal=SIGKILL",
+        "--kill-whom=main",
+        &fixture.daemon_unit,
+    ])
+    .expect("kill -9 the daemon");
+    assert!(
+        wait_for(Duration::from_secs(10), || cpu_weight(&scope) == "100"),
+        "reset did not revert the adopted scope: cpu.weight={}",
+        cpu_weight(&scope)
+    );
+    assert_eq!(
+        show(&scope, "ActiveState"),
+        "active",
+        "the adopted scope must keep running"
+    );
+
+    let _ = mutate(&["--user", "stop", &scope]);
+    let _ = scope_run.wait();
+    println!("RESULT live_systemd PASS adopted={scope}");
 }

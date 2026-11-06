@@ -219,6 +219,7 @@ pub struct Status {
     pub headroom: u64,
     pub margin: u64,
     pub classes: Vec<ClassRow>,
+    pub adopted: Vec<AdoptedRow>,
     pub protected: Vec<ProtectedRow>,
     pub queue: usize,
 }
@@ -240,6 +241,13 @@ pub struct ClassRow {
 pub struct ProtectedRow {
     pub unit: String,
     pub cpu_psi: f32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdoptedRow {
+    pub unit: String,
+    pub class: Class,
+    pub cpu_quota: Option<u64>,
 }
 
 /// `explain` payload (design §8): ring-buffer events for a unit or class, plus now.

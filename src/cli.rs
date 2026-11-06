@@ -437,13 +437,24 @@ fn explain(args: &[String]) -> Result<u8, (u8, String)> {
     Ok(0)
 }
 
-/// design: §5.7 — revert the three class slices only, success by exit status alone.
+/// design: §5.7 — revert the class slices and every present adopted unit, success by exit status.
 fn reset() -> u8 {
     let config = reset_config();
     let runner = systemd::Runner::real();
+    let mut units = Class::ALL.map(|class| config.class_slice(class)).to_vec();
+    let pool = runner
+        .show(&config.pool_slice, "ControlGroup")
+        .unwrap_or_default();
+    if let Some((parent, _)) = pool.trim_start_matches('/').rsplit_once('/') {
+        for unit in cgroup::list_units(Path::new(cgroup::CGROUP_ROOT), parent).unwrap_or_default() {
+            if config.adopt_class(&unit).is_some() {
+                units.push(unit);
+            }
+        }
+    }
     let mut code = 0;
-    for class in Class::ALL {
-        if let Err(error) = runner.revert(&config.class_slice(class)) {
+    for unit in units {
+        if let Err(error) = runner.revert(&unit) {
             eprintln!("{error}");
             code = 1;
         }

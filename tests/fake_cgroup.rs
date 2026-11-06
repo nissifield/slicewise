@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use slicewise::config::{Class, Config, Size};
+use slicewise::config::{Adopt, Class, Config, Size};
 use slicewise::daemon::{self, Daemon, Paths, Sampler};
 use slicewise::policy::BRAKE_HEADROOM;
 use slicewise::systemd::{Mode, Runner};
@@ -184,5 +184,53 @@ fn missing_unit_cgroup_omits_it_and_other_errors_keep_the_last_value() {
         snapshot.units.get(unit),
         Some(&(10 * MIB)),
         "a non-ENOENT read error keeps the last value"
+    );
+}
+
+#[test]
+fn adopt_writes_the_capped_weight_and_reset_matches_it() {
+    let (mut config, tmp, mut sampler, daemon) = scenario();
+    config.adopt.push(Adopt {
+        r#match: "orch-worker-*.scope".into(),
+        class: Class::Batch,
+    });
+    let parent = tmp.path().join("cgroup").join("app.slice");
+    fs::create_dir_all(parent.join("orch-worker-1.scope")).expect("fake scope");
+    fs::create_dir_all(parent.join("orch-other.service")).expect("fake service");
+
+    let runner = Runner::new(Mode::Record);
+    daemon::tick(
+        &daemon,
+        &mut sampler,
+        &config,
+        &runner,
+        Duration::from_secs(2),
+    );
+    let recorded = runner.recorded();
+    let adopt = vec![
+        "--user".to_string(),
+        "set-property".to_string(),
+        "--runtime".to_string(),
+        "orch-worker-1.scope".to_string(),
+        "CPUWeight=25".to_string(),
+    ];
+    assert!(recorded.contains(&adopt), "{recorded:?}");
+
+    // `reset` lists the pool's parent, keeps the matching unit and reverts it.
+    let present = slicewise::cgroup::list_units(&parent, "").expect("list parent");
+    let targets: Vec<String> = present
+        .into_iter()
+        .filter(|unit| config.adopt_class(unit).is_some())
+        .collect();
+    assert_eq!(targets, ["orch-worker-1.scope"]);
+    for unit in &targets {
+        runner.revert(unit).expect("revert");
+    }
+    assert!(
+        runner
+            .recorded()
+            .contains(&vec!["--user".into(), "revert".into(), targets[0].clone()]),
+        "{:?}",
+        runner.recorded()
     );
 }

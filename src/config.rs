@@ -184,6 +184,21 @@ fn default_protected_memory_low() -> Size {
     Size(2 * GIB)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Adopt {
+    pub r#match: String,
+    pub class: Class,
+}
+
+fn matches(pattern: &str, unit: &str) -> bool {
+    pattern.split_once('*').is_some_and(|(prefix, suffix)| {
+        unit.len() >= prefix.len() + suffix.len()
+            && unit.starts_with(prefix)
+            && unit.ends_with(suffix)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
@@ -213,6 +228,7 @@ pub struct Config {
     pub mem_per_job: Size,
     pub jobs_env: Vec<String>,
     pub protected: Vec<Protected>,
+    pub adopt: Vec<Adopt>,
     #[serde(rename = "class")]
     pub classes: Classes,
     pub tuning: Tuning,
@@ -233,6 +249,7 @@ impl Default for Config {
                 "CMAKE_BUILD_PARALLEL_LEVEL".to_string(),
             ],
             protected: Vec::new(),
+            adopt: Vec::new(),
             classes: Classes::default(),
             tuning: Tuning::default(),
         }
@@ -251,6 +268,13 @@ impl Config {
             .strip_suffix(".slice")
             .unwrap_or(&self.pool_slice);
         format!("{stem}-{}.slice", class.as_str())
+    }
+
+    pub fn adopt_class(&self, unit: &str) -> Option<Class> {
+        self.adopt
+            .iter()
+            .find(|a| matches(&a.r#match, unit))
+            .map(|a| a.class)
     }
 
     /// Parse a config without touching the filesystem; validation is separate.
@@ -364,6 +388,27 @@ impl Config {
                 protected.memory_low.0,
                 mem_total,
             )?;
+        }
+        if self.adopt.len() > 16 {
+            return invalid(format!("adopt = {}: at most 16 patterns", self.adopt.len()));
+        }
+        for (index, adopt) in self.adopt.iter().enumerate() {
+            let pattern = &adopt.r#match;
+            let unit_suffix = pattern.ends_with(".scope") || pattern.ends_with(".service");
+            if pattern.matches('*').count() != 1
+                || !unit_suffix
+                || !valid_unit_name(&pattern.replacen('*', "x", 1))
+            {
+                return invalid(format!(
+                    "adopt[{index}] {pattern:?}: one '*' and .scope/.service"
+                ));
+            }
+            if let Some(protected) = self.protected.iter().find(|p| matches(pattern, &p.unit)) {
+                return invalid(format!(
+                    "adopt[{index}] {pattern:?}: protected unit {}",
+                    protected.unit
+                ));
+            }
         }
         if self.pool_memory_max.0 <= crate::policy::margin(self) {
             return invalid(format!(
@@ -669,5 +714,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(error.contains("config error in"), "{error}");
         assert!(error.contains("TOML parse error"), "{error}");
+    }
+
+    #[test]
+    fn adopt_matcher_and_first_match_wins() {
+        let pattern = "orchestrator-worker-*.scope";
+        assert!(matches(pattern, "orchestrator-worker-1.scope"));
+        assert!(matches(pattern, "orchestrator-worker-.scope"));
+        assert!(!matches(pattern, "orchestrator-worker-1.service"));
+        assert!(!matches(pattern, "x-orchestrator-worker-1.scope"));
+
+        let config = Config::parse(
+            "[[adopt]]\nmatch = \"orch-worker-*.scope\"\nclass = \"normal\"\n\
+             [[adopt]]\nmatch = \"orch-*.scope\"\nclass = \"batch\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.adopt_class("orch-worker-1.scope"),
+            Some(Class::Normal)
+        );
+        assert_eq!(config.adopt_class("orch-other.scope"), Some(Class::Batch));
+        assert_eq!(config.adopt_class("orch-other.service"), None);
+    }
+
+    #[test]
+    fn adopt_validation_checks_star_suffix_cap_and_protected() {
+        let mut config = Config::default();
+        config.protected.push(Protected {
+            unit: "orch-x.service".into(),
+            cpu_weight: 200,
+            memory_low: Size(0),
+        });
+        config.adopt = vec![Adopt {
+            r#match: "orch-*.service".into(),
+            class: Class::Batch,
+        }];
+        assert!(
+            config
+                .validate(64 << 30)
+                .unwrap_err()
+                .contains("protected unit orch-x.service")
+        );
+
+        for bad in ["orch-worker.scope", "orch-*-*.scope", "orch-*.slice", "*"] {
+            let config = Config {
+                adopt: vec![Adopt {
+                    r#match: bad.into(),
+                    class: Class::Normal,
+                }],
+                ..Config::default()
+            };
+            let error = config.validate(64 << 30).unwrap_err();
+            assert!(
+                error.contains("one '*' and .scope/.service"),
+                "{bad}: {error}"
+            );
+        }
+
+        let config = Config {
+            adopt: (0..17)
+                .map(|n| Adopt {
+                    r#match: format!("worker-{n}-*.scope"),
+                    class: Class::Normal,
+                })
+                .collect(),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate(64 << 30)
+                .unwrap_err()
+                .contains("at most 16 patterns")
+        );
     }
 }

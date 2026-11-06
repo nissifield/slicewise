@@ -76,6 +76,8 @@ pub fn write_property(write: &Write) -> String {
     match (write.knob, write.to) {
         (Knob::CpuQuota, Some(percent)) => format!("CPUQuota={percent}%"),
         (Knob::CpuQuota, None) => "CPUQuota=".to_string(), // systemd rejects `infinity`
+        (Knob::CpuWeight, Some(weight)) => format!("CPUWeight={weight}"),
+        (Knob::CpuWeight, None) => "CPUWeight=".to_string(),
         (Knob::MemoryHigh, Some(bytes)) => format!("MemoryHigh={bytes}"),
         (Knob::MemoryHigh, None) => "MemoryHigh=infinity".to_string(),
     }
