@@ -271,6 +271,9 @@ impl Config {
     }
 
     pub fn adopt_class(&self, unit: &str) -> Option<Class> {
+        if !valid_unit_name(unit) || self.protected.iter().any(|p| p.unit == unit) {
+            return None;
+        }
         self.adopt
             .iter()
             .find(|a| matches(&a.r#match, unit))
@@ -394,14 +397,12 @@ impl Config {
         }
         for (index, adopt) in self.adopt.iter().enumerate() {
             let pattern = &adopt.r#match;
-            let unit_suffix = pattern.ends_with(".scope") || pattern.ends_with(".service");
+            let unit_suffix = pattern.ends_with(".scope");
             if pattern.matches('*').count() != 1
                 || !unit_suffix
                 || !valid_unit_name(&pattern.replacen('*', "x", 1))
             {
-                return invalid(format!(
-                    "adopt[{index}] {pattern:?}: one '*' and .scope/.service"
-                ));
+                return invalid(format!("adopt[{index}] {pattern:?}: one '*' and .scope"));
             }
             if let Some(protected) = self.protected.iter().find(|p| matches(pattern, &p.unit)) {
                 return invalid(format!(
@@ -738,25 +739,51 @@ mod tests {
     }
 
     #[test]
-    fn adopt_validation_checks_star_suffix_cap_and_protected() {
+    fn adopt_class_guards_unit_name_and_protected() {
         let mut config = Config::default();
         config.protected.push(Protected {
-            unit: "orch-x.service".into(),
+            unit: "orch-protected.scope".into(),
             cpu_weight: 200,
             memory_low: Size(0),
         });
         config.adopt = vec![Adopt {
-            r#match: "orch-*.service".into(),
+            r#match: "*.scope".into(),
+            class: Class::Batch,
+        }];
+        assert_eq!(
+            config.adopt_class("orch-worker-1.scope"),
+            Some(Class::Batch)
+        );
+        assert_eq!(config.adopt_class("-Hhost.scope"), None);
+        assert_eq!(config.adopt_class("orch-protected.scope"), None);
+    }
+
+    #[test]
+    fn adopt_validation_checks_star_suffix_cap_and_protected() {
+        let mut config = Config::default();
+        config.protected.push(Protected {
+            unit: "orch-x.scope".into(),
+            cpu_weight: 200,
+            memory_low: Size(0),
+        });
+        config.adopt = vec![Adopt {
+            r#match: "orch-*.scope".into(),
             class: Class::Batch,
         }];
         assert!(
             config
                 .validate(64 << 30)
                 .unwrap_err()
-                .contains("protected unit orch-x.service")
+                .contains("protected unit orch-x.scope")
         );
 
-        for bad in ["orch-worker.scope", "orch-*-*.scope", "orch-*.slice", "*"] {
+        for bad in [
+            "orch-worker.scope",
+            "orch-*-*.scope",
+            "orch-*.slice",
+            "orch-*.service",
+            "*",
+        ] {
             let config = Config {
                 adopt: vec![Adopt {
                     r#match: bad.into(),
@@ -765,10 +792,7 @@ mod tests {
                 ..Config::default()
             };
             let error = config.validate(64 << 30).unwrap_err();
-            assert!(
-                error.contains("one '*' and .scope/.service"),
-                "{bad}: {error}"
-            );
+            assert!(error.contains("one '*' and .scope"), "{bad}: {error}");
         }
 
         let config = Config {

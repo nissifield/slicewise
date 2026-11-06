@@ -320,7 +320,7 @@ Validation after parsing checks:
 - `pool_memory_max + system_reserve ≤ MemTotal`,
 - `pool_memory_max` greater than the margin (so > 512 MiB), so the pool's static `MemoryHigh` is always positive,
 - unit names in the systemd character set,
-- `[[adopt]]`: `match` has exactly one `*`, the rest is in the unit charset, and it ends in `.scope` or `.service`; at most 16 patterns, the first match wins, and a pattern that matches a `[[protected]]` unit is an error.
+- `[[adopt]]`: `match` has exactly one `*`, the rest is in the unit charset, and it ends in `.scope`; at most 16 patterns, the first match wins, and a pattern that matches a `[[protected]]` unit is an error.
 
 A parse error looks like this:
 ```

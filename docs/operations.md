@@ -233,7 +233,7 @@ The interface, as implemented in M2:
 
 - `match` is matched against unit names that are **direct children of the pool's parent slice** (`app.slice` by
   default), i.e. the protected unit's siblings. It contains exactly one `*`; the rest is in the systemd unit
-  character set and the pattern ends in `.scope` or `.service`.
+  character set and the pattern ends in `.scope`.
 - At most 16 patterns; the first match wins. A pattern that matches a `[[protected]]` unit is a config error
   (exit 78).
 - The weight is the class `CPUWeight`, capped at the pool slice's weight (100), so interactive and normal adopt as
@@ -262,9 +262,9 @@ the orchestrator.
 
 ## 8. Day to day
 
-- `slicewise status` shows the pool (cap, working set, headroom, margin), one row per class, the protected units'
-  CPU PSI, the queue and active brakes/clamps. `--json` is the same data for tooling. It exits 3 when the daemon
-  is unreachable and then prints the cgroupfs view only.
+- `slicewise status` shows the pool (cap, working set, headroom, margin), one row per class, one row per adopted
+  unit, the protected units' CPU PSI, the queue and active brakes/clamps. `--json` is the same data for tooling. It
+  exits 3 when the daemon is unreachable and then prints the cgroupfs view only.
 - `slicewise explain <unit|class>` replays the ring buffer for that unit and its class, then shows the current
   numbers.
 - The journal is logfmt: `level=info event=brake_on target=… knob=MemoryHigh from=infinity to=… reason="…"`.

@@ -141,7 +141,7 @@ pub fn slice_stats(root: &Path, rel: &str) -> io::Result<SliceStats> {
 pub fn list_units(root: &Path, rel: &str) -> io::Result<Vec<String>> {
     let mut units: Vec<String> = fs::read_dir(path(root, rel))?
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".scope") || name.ends_with(".service"))
+        .filter(|name| name.ends_with(".scope"))
         .collect();
     units.sort();
     Ok(units)
@@ -245,12 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn list_units_keeps_scope_and_service_only() {
+    fn list_units_keeps_scopes_only() {
         let dir = std::env::temp_dir().join(format!("slicewise-list-{}", std::process::id()));
-        for name in ["b.service", "a.scope", "c.slice", "d.txt"] {
+        for name in ["b.service", "a.scope", "c.slice", "d.txt", "e.scope"] {
             fs::create_dir_all(dir.join(name)).unwrap();
         }
-        assert_eq!(list_units(&dir, "").unwrap(), ["a.scope", "b.service"]);
+        assert_eq!(list_units(&dir, "").unwrap(), ["a.scope", "e.scope"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
