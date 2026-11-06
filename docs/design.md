@@ -122,7 +122,7 @@ The only write outside systemd is the wrapper raising its own `oom_score_adj` fo
 | Knob | Set on | Static or dynamic | By |
 |---|---|---|---|
 | `cpu.weight` | class slices, pool, protected | static | unit files |
-| `cpu.max` | pool (`(online − reserve_cpus) × 100 %`, if `reserve_cpus > 0`) | static | unit file |
+| `cpu.max` | pool (`(online − reserve_cpus) × 100 %`, only if `reserve_cpus > 0`; off by default because a pool quota throttles every class, interactive included) | static | unit file |
 | `cpu.max` | batch slice | **dynamic** (clamp) | daemon `CPUQuota=` |
 | `memory.max` | pool (`pool_memory_max`) | static, **never changed** | unit file |
 | `memory.high` | pool (`pool_memory_max − margin`) | static | unit file |
@@ -150,9 +150,9 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 ```
 
 **Rule M (memory brake).** Engaging the brake is immediate and not rate-limited, because safety comes first. Releasing it is slow.
-- If `H < margin`, set batch `MemoryHigh = working_set(batch) + 64 MiB`. Growth is then throttled, but no memory is reclaimed from under the task.
-- If `H < margin/2`, apply the same to normal.
-- When `H > 2 × margin` for 5 consecutive ticks, release one class per 10 s, normal first: `MemoryHigh=infinity`.
+- If `H < 2 × margin`, set batch `MemoryHigh = working_set(batch) + 64 MiB`. This engages before the pool's static `MemoryHigh` (`pool_memory_max − margin`), so batch is held while there is still room for interactive work. Growth is then throttled, but no memory is reclaimed from under the task.
+- If `H < margin`, apply the same to normal.
+- When `H > 3 × margin` for 5 consecutive ticks, release one class per 10 s, normal first: `MemoryHigh=infinity`.
 - Interactive is never braked. Its only limit is the static pool cap.
 - The brake target is set once at engage and not retargeted while held; the skip rule therefore applies only to `CPUQuota`.
 
@@ -180,7 +180,7 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 Without swap, the allocator cannot get memory back. It can only:
 
 1. avoid admitting work that will not fit (Rule A),
-2. throttle the lowest class's growth early (Rule M), so the kernel's `memory.high` pressure lands on batch rather than on interactive work, and
+2. throttle the lowest class's growth early (Rule M, which engages at `2 × margin` headroom — before the pool's static `memory.high` at `margin` — M1c review), so the kernel's `memory.high` pressure lands on batch rather than on interactive work, and
 3. make the inevitable OOM pick the right victim: `OOMScoreAdjust` ordering by class, plus `memory.oom.group`, so a whole build dies cleanly instead of half of it.
 
 The allocator's own actions never cause an OOM. It never lowers a hard limit, never raises the pool cap and never sets `memory.high` below usage. A remaining OOM means that workloads together exceeded the static pool frame.
@@ -274,7 +274,7 @@ tick_secs       = 2
 pool_slice      = "app-slicewise.slice"   # class slices = <pool stem>-<class>.slice
 # pool_memory_max = "12G"   # default (unset or 0): (MemTotal - system_reserve) * 3/4; static frame written by slicewise units
 system_reserve  = "2G"                    # MemAvailable floor for everything outside the pool
-reserve_cpus    = 1                       # pool CPUQuota = (online - reserve) * 100%
+reserve_cpus    = 0                       # > 0: pool CPUQuota = (online - reserve) * 100 %; also throttles interactive (§5.3)
 mem_per_job     = "1G"
 jobs_env        = ["SLICEWISE_JOBS", "CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL"]
 
@@ -394,15 +394,15 @@ CI runs this on each PR. Before merging anything that touches `daemon.rs`, `syst
 - that `ExecStopPost` reset runs after `kill -9` of the daemon,
 - that the env hint is visible inside the unit.
 
-**Load scenario (`tests/load_scenario.rs`, live-gated).** It uses `examples/hog.rs`, which has three modes: `cpu N`, `mem SIZE` and `probe`. `probe` does 1-thread work with 10 ms sleeps and records how late each wake-up is. Sizes scale with the host: `C = online − reserve_cpus`, and the pool size `P` is set to 50 % of `MemTotal` for the test. Pass criteria:
+**Load scenario (`tests/load_scenario.rs`, live-gated).** It uses `examples/hog.rs`, which has three modes: `cpu N`, `mem SIZE` and `probe`. `probe` does 1-thread work with 10 ms sleeps and records how late each wake-up is. Sizes scale with the host: `C = online − reserve_cpus`, and `P = min(50 % of MemTotal, 4 GiB)`; the load frame uses the default config except `pool_slice`, `pool_memory_max = P`, `system_reserve` and `tick_secs`. The suite skips unless `MemAvailable ≥ P + 1 GiB`. Pass criteria:
 
 1. **U1.** A lone batch `cpu C` gets ≥ 0.9·C CPUs over 20 s, measured from the `cpu.stat` `usage_usec` delta.
 2. **U2.** With `probe` interactive plus two batch `cpu C` hogs, interactive `cpu.pressure` some avg10 is ≤ 10 % within 30 s, the probe's p95 lateness is ≤ 4× its idle baseline, and the batch hogs together still get ≥ 0.5·C.
 3. **No oscillation.** At most 6 clamp/unclamp actions in 5 minutes, and none reversed within 30 s.
 4. **U3/U4.** Batch `mem 0.6P` is admitted. A second batch `mem 0.6P` is queued, and admitted within 2 ticks of the first one exiting. The `oom_kill` count in every class slice's `memory.events` is 0.
-5. **Brake.** Batch holds 0.45P and keeps growing while interactive grows to 0.45P. Batch `MemoryHigh` is set and interactive is not OOM-killed. If an OOM does occur, the `oom_kill` is counted in the batch slice only.
+5. **Brake.** Batch starts at 0.45P and keeps growing while interactive grows to 0.3P during the contention. Batch `MemoryHigh` is set, interactive reaches its target with `memory.pressure` some avg10 ≤ 10 %, and interactive is not OOM-killed. After batch exits the brake releases (`brake_off` logged, batch `memory.high` back to `max`). If an OOM does occur, the `oom_kill` is counted in the batch slice only.
 6. **Fail-safe.** After `kill -9` of the daemon, the class slices are back to their unit-file values within 10 s, all hogs are still running, and `slicewise run` during the outage launches with the fallback warning.
-7. **U5.** The number of `set-property` calls in the debug log equals the number of action log lines.
+7. **U5.** The number of `set-property` invocations (counted by a `systemctl` shim on the daemon's `PATH`) equals the number of action log lines.
 
 ## 11. Repo layout and dependencies
 
@@ -425,7 +425,7 @@ examples/hog.rs       cpu / mem / probe load generator (tests only, not installe
 tests/                common/mod.rs (tempdir helper), fake_cgroup.rs, live_systemd.rs, load_scenario.rs, m0_live.rs
 integrations/hermes/  README.md (runner argv change, task-type→class mapping, adopt pattern example)
 integrations/generic/ README.md (any orchestrator / human)
-docs/                 design.md (this), protocol.md, operations.md (install, migrate, rollback), m0-findings.md
+docs/                 design.md (this), protocol.md, operations.md (install, migrate, rollback), m0-findings.md, m1c-load-results.md
 .claude/agents/       role definitions (§13); AGENTS.md carries the shared rules for any agent CLI
 third_party/vendor/   `cargo vendor` output, committed
 third_party/ponytail/ LICENSE for the adapted agent-instruction style
@@ -511,6 +511,7 @@ Rules every role follows:
 - Fail-open for launch when the daemon is absent.
 - Logfmt through `eprintln!`.
 - Three dependencies; threads.
+- No pool CPU quota by default (M1c): CPU quota throttling applies to the whole cgroup and stalls interactive work; weights plus Rule C protect the orchestrator.
 - Vendored sources committed.
 - **License: Apache-2.0 OR MIT**, the Rust ecosystem norm, unless the owner prefers otherwise.
 

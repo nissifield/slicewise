@@ -71,11 +71,11 @@ impl Runner {
     }
 }
 
-/// The `set-property` value for one policy write; `None` is `infinity` (design §5.4).
+/// The `set-property` value for one policy write; `None` releases the knob (design §5.4).
 pub fn write_property(write: &Write) -> String {
     match (write.knob, write.to) {
         (Knob::CpuQuota, Some(percent)) => format!("CPUQuota={percent}%"),
-        (Knob::CpuQuota, None) => "CPUQuota=infinity".to_string(),
+        (Knob::CpuQuota, None) => "CPUQuota=".to_string(), // systemd rejects `infinity`
         (Knob::MemoryHigh, Some(bytes)) => format!("MemoryHigh={bytes}"),
         (Knob::MemoryHigh, None) => "MemoryHigh=infinity".to_string(),
     }
@@ -127,5 +127,35 @@ pub fn run(program: &str, args: &[&str], deadline: Duration) -> Result<String, S
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{program}: {}: {}", output.status, stderr.trim()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Class;
+    use crate::policy::WriteEvent;
+
+    #[test]
+    fn none_releases_a_knob_without_writing_infinity_to_cpu_quota() {
+        let write = |knob, to| Write {
+            event: WriteEvent::Unclamp,
+            slice: "app-test.slice".to_string(),
+            class: Class::Batch,
+            knob,
+            from: None,
+            to,
+            reason: String::new(),
+        };
+        // systemd's CPUQuota parser rejects `infinity`; the empty value resets it.
+        assert_eq!(write_property(&write(Knob::CpuQuota, None)), "CPUQuota=");
+        assert_eq!(
+            write_property(&write(Knob::MemoryHigh, None)),
+            "MemoryHigh=infinity"
+        );
+        assert_eq!(
+            write_property(&write(Knob::CpuQuota, Some(400))),
+            "CPUQuota=400%"
+        );
     }
 }

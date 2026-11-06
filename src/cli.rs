@@ -702,6 +702,7 @@ mod tests {
         let mut config = Config {
             pool_memory_max: Size(8 << 30),
             system_reserve: Size(1 << 30),
+            reserve_cpus: 1,
             ..Config::default()
         };
         config.protected.push(Protected {

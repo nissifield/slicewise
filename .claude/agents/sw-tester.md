@@ -29,7 +29,7 @@ return a test plan instead of editing.
 - Add dev-dependencies (`tempfile`, `proptest` and friends are rejected in §11); use the 15-line tempdir helper
   and the LCG loop.
 - Skip, `#[ignore]` or loosen a failing test to get green. A failing test is a finding; report it.
-- Hard-code host sizes. Scale from `C = online − reserve_cpus` and `P = 50 % of MemTotal` (§10).
+- Hard-code host sizes. Scale from `C = online − reserve_cpus` and `P = min(50 % of MemTotal, 4 GiB)` (§10).
 - Edit `src/`; if code needs a seam to be testable, ask the builder.
 - Commit or push unless asked.
 

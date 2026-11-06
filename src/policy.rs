@@ -206,7 +206,7 @@ impl State {
         }
         self.last_observe = Some(now);
         let headroom = headroom(snapshot, config);
-        if headroom > margin(config).saturating_mul(2) {
+        if headroom > margin(config).saturating_mul(3) {
             self.high_headroom_ticks = self.high_headroom_ticks.saturating_add(1);
         } else {
             self.high_headroom_ticks = 0;
@@ -439,15 +439,13 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
     let margin = margin(config);
     let mut actions = Vec::new();
 
-    for (class, threshold) in [(Class::Batch, margin), (Class::Normal, margin / 2)] {
+    for (class, threshold, label) in [
+        (Class::Batch, margin.saturating_mul(2), "2 * margin"),
+        (Class::Normal, margin, "margin"),
+    ] {
         if headroom < threshold && state.memory_high[class.index()].is_none() {
             // design: §5.4 — engaged once at ws + 64 MiB and not retargeted while held.
             let target = working_set(snapshot.class(class)).saturating_add(BRAKE_HEADROOM);
-            let (label, bound) = if class == Class::Batch {
-                ("margin", margin)
-            } else {
-                ("margin/2", threshold)
-            };
             actions.push(Action::Write(Write {
                 event: WriteEvent::BrakeOn,
                 slice: config.class_slice(class),
@@ -458,7 +456,7 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
                 reason: format!(
                     "pool headroom {} < {label} {}",
                     fmt_bytes(headroom),
-                    fmt_bytes(bound)
+                    fmt_bytes(threshold)
                 ),
             }));
         }
@@ -484,9 +482,9 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
                     from: state.memory_high[class.index()],
                     to: None,
                     reason: format!(
-                        "pool headroom {} > 2 * margin {} for {} ticks",
+                        "pool headroom {} > 3 * margin {} for {} ticks",
                         fmt_bytes(headroom),
-                        fmt_bytes(margin.saturating_mul(2)),
+                        fmt_bytes(margin.saturating_mul(3)),
                         state.high_headroom_ticks
                     ),
                 }));
@@ -795,7 +793,8 @@ mod tests {
     fn brake_engages_batch_then_normal_and_never_interactive() {
         let config = config();
         let mut state = State::default();
-        let snapshot = make_snapshot(8 * GIB - 400 * (1 << 20), 8 * GIB, 200 * (1 << 20));
+        // Headroom between margin and 2 * margin: only batch is braked.
+        let snapshot = make_snapshot(8 * GIB - 900 * (1 << 20), 8 * GIB, 200 * (1 << 20));
         let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
         let brakes: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOn)
@@ -805,7 +804,8 @@ mod tests {
         assert_eq!(brakes[0].to, Some(200 * (1 << 20) + BRAKE_HEADROOM));
         state.apply(&actions, Duration::ZERO);
 
-        let snapshot = make_snapshot(8 * GIB - 200 * (1 << 20), 8 * GIB, 0);
+        // Headroom below margin: normal is braked too.
+        let snapshot = make_snapshot(8 * GIB - 400 * (1 << 20), 8 * GIB, 0);
         let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(2));
         let brakes: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOn)

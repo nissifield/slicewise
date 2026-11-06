@@ -225,7 +225,7 @@ impl Default for Config {
             pool_slice: default_pool_slice(),
             pool_memory_max: Size(0),
             system_reserve: Size(2 * GIB),
-            reserve_cpus: 1,
+            reserve_cpus: 0,
             mem_per_job: Size(GIB),
             jobs_env: vec![
                 "SLICEWISE_JOBS".to_string(),
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(config.pool_slice, "app-slicewise.slice");
         assert_eq!(config.pool_memory_max, Size(0));
         assert_eq!(config.system_reserve, Size(2 << 30));
-        assert_eq!(config.reserve_cpus, 1);
+        assert_eq!(config.reserve_cpus, 0);
         assert_eq!(config.mem_per_job, Size(1 << 30));
         assert_eq!(config.classes.cpu_weight(Class::Interactive), 400);
         assert_eq!(config.classes.oom_score_adj(Class::Normal), Some(300));
