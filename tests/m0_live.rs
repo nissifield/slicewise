@@ -689,7 +689,10 @@ fn assumption_10_musl_static_binary() {
         "binary is not statically linked: {description}"
     );
 
-    let output = Command::new(&binary).output().expect("run musl binary");
+    let output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("run musl binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.starts_with("slicewise "),

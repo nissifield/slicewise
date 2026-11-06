@@ -493,4 +493,33 @@ mod tests {
             serde_json::from_slice(br#"{"v":1,"ok":true,"future":1}"#).unwrap();
         assert_eq!(response, Response::new(true));
     }
+
+    #[test]
+    fn socket_round_trip_over_a_unix_stream_pair() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = thread::spawn(move || {
+            let mut reader = io::BufReader::new(server.try_clone().unwrap());
+            let request = read_one(&mut reader, MEM).unwrap();
+            let Request::Admit { unit, .. } = request else {
+                panic!("expected admit");
+            };
+            let mut writer = server;
+            write_one(&mut writer, &Response::admit(3, format!("admitted {unit}"))).unwrap();
+        });
+        client
+            .write_all(b"{\"v\":1,\"op\":\"admit\",\"unit\":\"a.service\",\"class\":\"batch\"}\n")
+            .unwrap();
+        let mut reader = io::BufReader::new(client);
+        let mut line = String::new();
+        io::BufRead::read_line(&mut reader, &mut line).unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(response.decision, Some(DecisionReply::Admit));
+        assert_eq!(response.jobs, Some(3));
+        assert_eq!(response.reason.as_deref(), Some("admitted a.service"));
+        handle.join().unwrap();
+    }
 }

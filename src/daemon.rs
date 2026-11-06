@@ -52,7 +52,6 @@ pub struct Sampler {
     paths: Paths,
     pool_rel: Option<String>,
     protected_rel: BTreeMap<String, String>,
-    protected_psi: BTreeMap<String, f32>,
     last_pool: SliceStats,
     last_classes: [SliceStats; 3],
     last_units: BTreeMap<String, u64>,
@@ -67,7 +66,6 @@ impl Sampler {
             paths,
             pool_rel: None,
             protected_rel: BTreeMap::new(),
-            protected_psi: BTreeMap::new(),
             last_pool: SliceStats::default(),
             last_classes: [SliceStats::default(); 3],
             last_units: BTreeMap::new(),
@@ -150,14 +148,11 @@ impl Sampler {
         {
             self.protected_rel.insert(unit.to_string(), rel);
         }
-        let value = self
-            .protected_rel
+        self.protected_rel
             .get(unit)
             .and_then(|rel| cgroup::read_trimmed(root, &format!("{rel}/cpu.pressure")).ok())
             .and_then(|text| cgroup::parse_psi(&text))
-            .map_or(0.0, |psi| psi.some_avg10);
-        self.protected_psi.insert(unit.to_string(), value);
-        value
+            .map_or(0.0, |psi| psi.some_avg10)
     }
 
     /// ENOENT in every class means the unit has no cgroup; any other error keeps
