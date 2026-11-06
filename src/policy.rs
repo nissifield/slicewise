@@ -187,6 +187,8 @@ impl State {
             .retain(|r| now.saturating_sub(r.admitted_at) < RESERVATION_TTL);
     }
 
+    // shortcut: decide expires first; an admit between ticks may count a reservation
+    // for less than one tick past TTL.
     pub fn outstanding(&self, _now: Duration) -> u64 {
         self.reservations
             .iter()
