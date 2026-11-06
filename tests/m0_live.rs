@@ -477,11 +477,20 @@ fn assumption_6_oom_score_adjust_raise_and_lower() {
 
     let raised = fx.service("oom-raise", &["OOMScoreAdjust=800"], &["sleep", "30"]);
     let pid = fx.main_pid(&raised);
-    let applied: i32 = fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
-        .expect("read oom_score_adj")
-        .trim()
-        .parse()
-        .expect("parse oom_score_adj");
+    // MainPID can be read before the executor has applied the setting and exec'd: poll up to 2 s.
+    let read_adj = || -> i32 {
+        fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+            .expect("read oom_score_adj")
+            .trim()
+            .parse()
+            .expect("parse oom_score_adj")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut applied = read_adj();
+    while applied != 800 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        applied = read_adj();
+    }
     assert_eq!(applied, 800, "raising OOMScoreAdjust was not applied");
 
     let class = fx.class.clone();
