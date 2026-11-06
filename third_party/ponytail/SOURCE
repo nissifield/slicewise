@@ -1,0 +1,4 @@
+Upstream: https://github.com/DietrichGebert/ponytail
+Commit: 09c434a (approximate: adapted from upstream main as of 2026-10-25)
+License: MIT (see LICENSE in this directory)
+Used by: AGENTS.md, .claude/agents/*.md (instruction style adapted)
