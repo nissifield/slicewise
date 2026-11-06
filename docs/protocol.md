@@ -18,7 +18,7 @@ Design §6.2 is authoritative for framing, strictness and errors. This file reco
 ## Still to extract from design §6
 
 - Socket location, mode and lifetime (`$XDG_RUNTIME_DIR/slicewise.sock`, 0600, no `/tmp` fallback).
-- Framing: one request per connection, newline-delimited JSON, 64 KiB limit, 2 s read timeout, 64-connection cap.
+- Framing: one request per connection, newline-delimited JSON, 64 KiB limit, one overall 2 s request deadline, 64-connection cap.
 - Versioning (`v`) and strictness (`deny_unknown_fields`).
 - Requests: `admit`, `status`, `explain`, with every field and its bounds.
 - Responses: `admit`, `queued` (and its follow-up line), `reject`, and each error code.
