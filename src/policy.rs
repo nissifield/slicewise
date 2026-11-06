@@ -2,7 +2,6 @@
 //! No I/O and no clock reads; the caller passes `now` and applies the actions.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
 use std::time::Duration;
 
 use crate::cgroup::SliceStats;
@@ -114,19 +113,10 @@ impl Admission {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Knob {
     MemoryHigh,
     CpuQuota,
-}
-
-impl Knob {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Knob::MemoryHigh => "MemoryHigh",
-            Knob::CpuQuota => "CPUQuota",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,16 +124,6 @@ pub enum Limit {
     Infinity,
     Bytes(u64),
     Percent(u32),
-}
-
-impl fmt::Display for Limit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Limit::Infinity => f.write_str("infinity"),
-            Limit::Bytes(bytes) => write!(f, "{bytes}"),
-            Limit::Percent(percent) => write!(f, "{percent}%"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,20 +167,6 @@ impl Action {
         match self {
             Action::Admission(admission) => admission.event(),
             Action::Write(write) => write.event.as_str(),
-        }
-    }
-
-    pub fn target(&self) -> &str {
-        match self {
-            Action::Admission(admission) => &admission.unit,
-            Action::Write(write) => &write.slice,
-        }
-    }
-
-    pub fn reason(&self) -> &str {
-        match self {
-            Action::Admission(admission) => &admission.reason,
-            Action::Write(write) => &write.reason,
         }
     }
 }
@@ -269,6 +235,7 @@ impl State {
         for action in actions {
             match action {
                 Action::Write(write) => {
+                    // design: §5.4 — a brake engage also restarts the per-slice write clock.
                     self.last_write.insert(write.slice.clone(), now);
                     match write.knob {
                         Knob::MemoryHigh => {
@@ -433,6 +400,7 @@ fn admission(
             }
         }
         Class::Batch => {
+            // design: §5.4 — a non-empty queue keeps later batch work behind it (FIFO).
             if fits && (from_queue || state.queue.is_empty()) {
                 Decision::Admit
             } else if !request.queue {
@@ -475,6 +443,7 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
 
     for (class, threshold) in [(Class::Batch, margin), (Class::Normal, margin / 2)] {
         if headroom < threshold && state.memory_high[class.index()].is_none() {
+            // design: §5.4 — engaged once at ws + 64 MiB and not retargeted while held.
             let target = working_set(snapshot.class(class)).saturating_add(BRAKE_HEADROOM);
             let bound = if class == Class::Batch {
                 format!("margin {}", fmt_bytes(margin))
@@ -1019,7 +988,6 @@ mod tests {
             }
             let mut now = Duration::ZERO;
             let mut seen: BTreeMap<String, Duration> = BTreeMap::new();
-            let mut last_engage: BTreeMap<(Class, Knob), Duration> = BTreeMap::new();
             let mut high = next(&mut lcg) % 2 == 0;
             let mut run = 0_u32;
             let mut run_ticks = 2 + (next(&mut lcg) % 3) as u32;
@@ -1081,18 +1049,11 @@ mod tests {
                         }
                         seen.insert(write.slice.clone(), now);
                     }
-                    if matches!(write.event, WriteEvent::BrakeOff | WriteEvent::Unclamp)
-                        && let Some(engage) = last_engage.get(&(write.class, write.knob))
-                    {
-                        assert!(
-                            now.saturating_sub(*engage) >= Duration::from_secs(30),
-                            "engage/release within 30 s for {}",
-                            write.slice
-                        );
-                    }
-                    if matches!(write.event, WriteEvent::BrakeOn | WriteEvent::Clamp) {
-                        last_engage.insert((write.class, write.knob), now);
-                    }
+                    assert!(
+                        !matches!(write.event, WriteEvent::BrakeOff | WriteEvent::Unclamp),
+                        "release inside an oscillating sequence (30 s hysteresis violated): {}",
+                        write.slice
+                    );
                 }
                 state.apply(&actions, now);
             }

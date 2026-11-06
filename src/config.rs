@@ -3,7 +3,6 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -59,6 +58,7 @@ impl<'de> Deserialize<'de> for Size {
 /// Plain bytes, a `K/M/G/T` binary suffix, or `infinity` (`u64::MAX`).
 pub fn parse_size(text: &str) -> Result<u64, String> {
     let text = text.trim();
+    // design: §7 — `infinity` is represented as `u64::MAX`.
     if text.eq_ignore_ascii_case("infinity") {
         return Ok(u64::MAX);
     }
@@ -80,7 +80,7 @@ fn invalid_size(text: &str) -> String {
     format!("invalid size {text:?}: expected bytes or a K/M/G/T suffix")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     Interactive,
@@ -296,13 +296,17 @@ impl Config {
 
     /// Read, parse and validate; `mem_total` is injected for testability (§7).
     pub fn load(path: &Path, mem_total: u64) -> Result<Self, ConfigError> {
-        let text = fs::read_to_string(path).map_err(|e| ConfigError::Read(path.into(), e))?;
-        let config = Self::parse(&text).map_err(|e| ConfigError::Parse(path.into(), e))?;
+        let text = fs::read_to_string(path).map_err(|e| {
+            ConfigError(format!("config error: cannot read {}: {e}", path.display()))
+        })?;
+        let config = Self::parse(&text)
+            .map_err(|e| ConfigError(format!("config error in {}: {e}", path.display())))?;
         config.validate(mem_total)?;
         Ok(config)
     }
 
     pub fn validate(&self, mem_total: u64) -> Result<(), ConfigError> {
+        // design: §7 — the design gives no tick floor, but zero would busy-loop.
         if self.tick_secs == 0 {
             return invalid("tick_secs = 0: must be >= 1");
         }
@@ -323,7 +327,7 @@ impl Config {
             .0
             .checked_add(self.system_reserve.0)
             .ok_or_else(|| {
-                ConfigError::Invalid("pool_memory_max + system_reserve overflows".into())
+                ConfigError("config error: pool_memory_max + system_reserve overflows".into())
             })?;
         if frame > mem_total {
             return invalid(format!(
@@ -380,7 +384,7 @@ fn check_size(field: &str, size: u64, mem_total: u64) -> Result<(), ConfigError>
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
-    Err(ConfigError::Invalid(message.into()))
+    Err(ConfigError(format!("config error: {}", message.into())))
 }
 
 /// Systemd unit name character set and a known suffix (design §9).
@@ -413,35 +417,15 @@ pub fn discover_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug)]
-pub enum ConfigError {
-    Read(PathBuf, io::Error),
-    Parse(PathBuf, toml::de::Error),
-    Invalid(String),
-}
+pub struct ConfigError(pub String);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::Read(path, error) => {
-                write!(f, "config error: cannot read {}: {error}", path.display())
-            }
-            ConfigError::Parse(path, error) => {
-                write!(f, "config error in {}: {error}", path.display())
-            }
-            ConfigError::Invalid(message) => write!(f, "config error: {message}"),
-        }
+        f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ConfigError::Read(_, error) => Some(error),
-            ConfigError::Parse(_, error) => Some(error),
-            ConfigError::Invalid(_) => None,
-        }
-    }
-}
+impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {

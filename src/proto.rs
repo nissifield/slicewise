@@ -11,14 +11,18 @@ use crate::config::{Class, valid_unit_name};
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const JOBS_HINT_MAX: u32 = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Request {
     Admit {
         v: u32,
         unit: String,
         class: Class,
+        #[serde(default)]
         mem_hint: Option<u64>,
+        #[serde(default)]
         jobs_hint: Option<u32>,
+        #[serde(default = "default_queue")]
         queue: bool,
     },
     Status {
@@ -30,108 +34,49 @@ pub enum Request {
     },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Op {
-    Admit,
-    Status,
-    Explain,
+fn default_queue() -> bool {
+    true
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRequest {
-    v: u32,
-    op: Op,
-    #[serde(default)]
-    unit: Option<String>,
-    #[serde(default)]
-    class: Option<Class>,
-    #[serde(default)]
-    mem_hint: Option<u64>,
-    #[serde(default)]
-    jobs_hint: Option<u32>,
-    #[serde(default)]
-    queue: Option<bool>,
-    #[serde(default)]
-    target: Option<String>,
+impl Request {
+    fn validate(&self) -> Result<(), ProtoError> {
+        match self {
+            Request::Admit {
+                v, unit, jobs_hint, ..
+            } => {
+                check_version(*v)?;
+                if !valid_unit_name(unit) {
+                    return Err(ProtoError::BadRequest(format!(
+                        "unit = {unit:?}: invalid systemd unit name"
+                    )));
+                }
+                if let Some(jobs) = jobs_hint
+                    && *jobs > JOBS_HINT_MAX
+                {
+                    return Err(ProtoError::BadRequest(format!(
+                        "jobs_hint = {jobs}: must be <= {JOBS_HINT_MAX}"
+                    )));
+                }
+            }
+            Request::Status { v } | Request::Explain { v, .. } => check_version(*v)?,
+        }
+        Ok(())
+    }
+}
+
+fn check_version(v: u32) -> Result<(), ProtoError> {
+    if v == 1 {
+        Ok(())
+    } else {
+        Err(ProtoError::UnsupportedVersion(v))
+    }
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Request, ProtoError> {
-    let raw: RawRequest =
+    let request: Request =
         serde_json::from_slice(bytes).map_err(|e| ProtoError::BadRequest(e.to_string()))?;
-    if raw.v != 1 {
-        return Err(ProtoError::UnsupportedVersion(raw.v));
-    }
-    match raw.op {
-        Op::Admit => {
-            if raw.target.is_some() {
-                return Err(unexpected("target", "admit"));
-            }
-            let unit = raw
-                .unit
-                .ok_or_else(|| ProtoError::BadRequest("missing field `unit`".into()))?;
-            let class = raw
-                .class
-                .ok_or_else(|| ProtoError::BadRequest("missing field `class`".into()))?;
-            if !valid_unit_name(&unit) {
-                return Err(ProtoError::BadRequest(format!(
-                    "unit = {unit:?}: invalid systemd unit name"
-                )));
-            }
-            if let Some(jobs) = raw.jobs_hint
-                && jobs > JOBS_HINT_MAX
-            {
-                return Err(ProtoError::BadRequest(format!(
-                    "jobs_hint = {jobs}: must be <= {JOBS_HINT_MAX}"
-                )));
-            }
-            Ok(Request::Admit {
-                v: raw.v,
-                unit,
-                class,
-                mem_hint: raw.mem_hint,
-                jobs_hint: raw.jobs_hint,
-                queue: raw.queue.unwrap_or(true),
-            })
-        }
-        Op::Status => {
-            for (present, field) in [
-                (raw.unit.is_some(), "unit"),
-                (raw.class.is_some(), "class"),
-                (raw.mem_hint.is_some(), "mem_hint"),
-                (raw.jobs_hint.is_some(), "jobs_hint"),
-                (raw.queue.is_some(), "queue"),
-                (raw.target.is_some(), "target"),
-            ] {
-                if present {
-                    return Err(unexpected(field, "status"));
-                }
-            }
-            Ok(Request::Status { v: raw.v })
-        }
-        Op::Explain => {
-            for (present, field) in [
-                (raw.unit.is_some(), "unit"),
-                (raw.class.is_some(), "class"),
-                (raw.mem_hint.is_some(), "mem_hint"),
-                (raw.jobs_hint.is_some(), "jobs_hint"),
-                (raw.queue.is_some(), "queue"),
-            ] {
-                if present {
-                    return Err(unexpected(field, "explain"));
-                }
-            }
-            let target = raw
-                .target
-                .ok_or_else(|| ProtoError::BadRequest("missing field `target`".into()))?;
-            Ok(Request::Explain { v: raw.v, target })
-        }
-    }
-}
-
-fn unexpected(field: &str, op: &str) -> ProtoError {
-    ProtoError::BadRequest(format!("unexpected field `{field}` for op {op}"))
+    request.validate()?;
+    Ok(request)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +207,7 @@ impl From<io::Error> for ProtoError {
 pub fn read_one<R: Read>(reader: &mut R) -> Result<Request, ProtoError> {
     let mut buffer = Vec::new();
     let mut byte = [0_u8; 1];
+    // shortcut: one byte per read; requests are capped at 64 KiB and rare (§6.2).
     loop {
         match reader.read(&mut byte)? {
             0 => break,
@@ -348,6 +294,12 @@ mod tests {
         assert!(matches!(error, ProtoError::BadRequest(_)));
         assert!(error.to_string().contains("unknown field `mystery`"));
 
+        let error = parse_request(
+            br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","target":"x"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `target`"));
+
         let error = parse_request(br#"{"v":1,"op":"dance"}"#).unwrap_err();
         assert!(error.to_string().contains("unknown variant `dance`"));
 
@@ -365,7 +317,7 @@ mod tests {
     #[test]
     fn field_validation_is_strict() {
         let error = parse_request(br#"{"v":1,"op":"status","unit":"a.service"}"#).unwrap_err();
-        assert!(error.to_string().contains("unexpected field `unit`"));
+        assert!(error.to_string().contains("unknown field `unit`"));
 
         let error = parse_request(br#"{"v":1,"op":"admit","unit":"bad name","class":"batch"}"#)
             .unwrap_err();
