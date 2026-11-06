@@ -547,7 +547,7 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
     // shortcut: k adopted units get N CPUs each, not N in total; upgrade if the soak shows clamps not helping.
     let mut actions = vec![Action::Write(write.clone())];
     for (unit, &class) in &state.adopted {
-        if class == Class::Batch && state.can_write(unit, now, config) {
+        if class == Class::Batch {
             actions.push(Action::Write(Write {
                 slice: unit.clone(),
                 ..write.clone()
@@ -559,10 +559,13 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
 
 fn adopt(snapshot: &Snapshot, state: &State, config: &Config) -> Vec<Action> {
     let mut actions = Vec::new();
-    for (unit, &class) in snapshot.adopted.iter().take(32) {
-        if state.adopted.contains_key(unit) {
-            continue;
-        }
+    let capacity = 32usize.saturating_sub(state.adopted.len());
+    for (unit, &class) in snapshot
+        .adopted
+        .iter()
+        .filter(|(unit, _)| !state.adopted.contains_key(*unit))
+        .take(capacity)
+    {
         let weight = Some(u64::from(config.classes.cpu_weight(class).min(100)));
         actions.push(aw(unit, class, CpuWeight, weight, Adopt));
         if let Some(cpus) = state.clamp_cpus.filter(|_| class == Class::Batch) {
@@ -596,7 +599,14 @@ pub fn decide(
     state.observe(snapshot, config, now);
     state.update_reservations(snapshot, now);
     let present = &snapshot.adopted;
-    state.adopted.retain(|unit, _| present.contains_key(unit));
+    let (adopted, last_write) = (&mut state.adopted, &mut state.last_write);
+    adopted.retain(|unit, _| {
+        let present = present.contains_key(unit);
+        if !present {
+            last_write.remove(unit);
+        }
+        present
+    });
     let mut actions = memory_brake(snapshot, state, config, now);
     let batch = config.class_slice(Class::Batch);
     let batch_written = actions.iter().any(|action| {
@@ -1269,7 +1279,6 @@ mod tests {
                             "adopted weight above the pool weight"
                         );
                         grace.insert(write.slice.clone());
-                        seen.insert(write.slice.clone(), now);
                     } else if write.event != WriteEvent::BrakeOn && !grace.remove(&write.slice) {
                         if let Some(last) = seen.get(&write.slice) {
                             assert!(
@@ -1432,6 +1441,70 @@ mod tests {
     }
 
     #[test]
+    fn first_sight_does_not_delay_the_next_unclamp_for_that_unit() {
+        let config = config();
+        let mut state = State {
+            clamp_cpus: Some(2),
+            last_write: BTreeMap::from([(config.class_slice(Class::Batch), Duration::ZERO)]),
+            ..State::default()
+        };
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
+
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(10));
+        let first: Vec<_> = writes(&actions)
+            .filter(|write| write.slice == "orch-worker-1.scope")
+            .collect();
+        assert_eq!(first.len(), 2, "weight plus the current clamp");
+        state.apply(&actions, Duration::from_secs(10));
+
+        // The batch slice clock is free; the unit must ride this unclamp 4 s later.
+        state.psi_low_ticks = CLAMP_RELEASE_TICKS;
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(14));
+        let unclamp: Vec<_> = writes(&actions)
+            .filter(|write| {
+                write.slice == "orch-worker-1.scope" && write.event == WriteEvent::Unclamp
+            })
+            .collect();
+        assert_eq!(unclamp.len(), 1, "an adopted unit rides the unclamp");
+        assert_eq!(unclamp[0].to, Some(300));
+    }
+
+    #[test]
+    fn adopt_cap_counts_already_tracked_units() {
+        let config = config();
+        let mut state = State::default();
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        for n in 0..32 {
+            snapshot
+                .adopted
+                .insert(format!("orch-worker-{n}.scope"), Class::Batch);
+        }
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
+        assert_eq!(
+            writes(&actions)
+                .filter(|write| write.event == WriteEvent::Adopt)
+                .count(),
+            32
+        );
+        state.apply(&actions, Duration::ZERO);
+        assert_eq!(state.adopted.len(), 32);
+
+        // A new name that sorts early must not push the tracked set past the cap.
+        snapshot
+            .adopted
+            .insert("orch-worker-.scope".into(), Class::Batch);
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(2));
+        assert!(
+            writes(&actions).all(|write| write.event != WriteEvent::Adopt),
+            "the cap must count tracked units"
+        );
+        assert_eq!(state.adopted.len(), 32);
+    }
+
+    #[test]
     fn adopt_tracks_at_most_32_and_forgets_vanished_units() {
         let config = config();
         let mut state = State::default();
@@ -1454,5 +1527,9 @@ mod tests {
         let empty = make_snapshot(0, 8 * GIB, 0);
         let _ = decide(&empty, &mut state, &config, Duration::from_secs(2));
         assert!(state.adopted.is_empty(), "a vanished unit is dropped");
+        assert!(
+            state.last_write.is_empty(),
+            "the vanished unit's write clock is pruned"
+        );
     }
 }
