@@ -192,6 +192,9 @@ impl Drop for SliceFixture {
             let _ = mutate(&["--user", "stop", unit]);
             let _ = mutate(&["--user", "reset-failed", unit]);
         }
+        // Revert first so no runtime drop-ins (set-property --runtime) outlive the test slices.
+        let _ = mutate(&["--user", "revert", &self.class]);
+        let _ = mutate(&["--user", "revert", &self.pool]);
         let _ = mutate(&["--user", "stop", &self.class]);
         let _ = mutate(&["--user", "stop", &self.pool]);
         let _ = mutate(&["--user", "reset-failed", &self.class]);
