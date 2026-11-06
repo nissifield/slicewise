@@ -25,6 +25,7 @@ pub struct Psi {
 pub struct SliceStats {
     pub memory_current: u64,
     pub inactive_file: u64,
+    pub pids_current: u64,
     pub cpu_pressure: Option<Psi>,
     pub memory_pressure: Option<Psi>,
 }
@@ -131,9 +132,18 @@ pub fn slice_stats(root: &Path, rel: &str) -> io::Result<SliceStats> {
     Ok(SliceStats {
         memory_current,
         inactive_file: stat.get("inactive_file").copied().unwrap_or(0),
+        pids_current: read_u64(root, &format!("{rel}/pids.current")).unwrap_or(0),
         cpu_pressure: pressure("cpu.pressure"),
         memory_pressure: pressure("memory.pressure"),
     })
+}
+
+pub fn mem_total_bytes(proc_root: &Path) -> io::Result<u64> {
+    let text = fs::read_to_string(proc_root.join("meminfo"))?;
+    parse_meminfo_bytes(&text)
+        .get("MemTotal")
+        .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "MemTotal missing"))
 }
 
 pub fn mem_available_bytes(proc_root: &Path) -> io::Result<u64> {

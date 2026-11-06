@@ -2,6 +2,7 @@
 //! 64 KiB limit, closed enums, `deny_unknown_fields`, `v` must be 1.
 
 use std::io::{self, BufRead, Read, Write};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +124,7 @@ pub enum ErrorCode {
     Busy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub v: u32,
     pub ok: bool,
@@ -135,6 +136,10 @@ pub struct Response {
     pub jobs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<Explain>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +155,8 @@ impl Response {
             position: None,
             jobs: None,
             reason: None,
+            status: None,
+            explain: None,
             error: None,
             detail: None,
         }
@@ -188,6 +195,80 @@ impl Response {
             ..Self::new(false)
         }
     }
+
+    pub fn status(status: Status) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::new(true)
+        }
+    }
+
+    pub fn explain(explain: Explain) -> Self {
+        Self {
+            explain: Some(explain),
+            ..Self::new(true)
+        }
+    }
+}
+
+/// `status` payload (design §8): the pool, one row per class, protected PSI and the queue.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    pub cap: u64,
+    pub working_set: u64,
+    pub headroom: u64,
+    pub margin: u64,
+    pub classes: Vec<ClassRow>,
+    pub protected: Vec<ProtectedRow>,
+    pub queue: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClassRow {
+    pub class: Class,
+    pub memory: u64,
+    pub memory_high: Option<u64>,
+    pub cpu_quota: Option<u64>,
+    pub cpu_psi: f32,
+    pub memory_psi: f32,
+    pub pids: u64,
+    pub brake_secs: Option<u64>,
+    pub clamp_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProtectedRow {
+    pub unit: String,
+    pub cpu_psi: f32,
+}
+
+/// `explain` payload (design §8): ring-buffer events for a unit or class, plus now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Explain {
+    pub target: String,
+    pub class: Option<Class>,
+    pub slice: Option<String>,
+    pub events: Vec<Event>,
+    pub current: Option<ClassRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub age_secs: u64,
+    pub event: String,
+    pub unit: Option<String>,
+    pub reason: String,
+}
+
+/// `$XDG_RUNTIME_DIR/<NAME>/<NAME>.sock` (design §6.2); there is no `/tmp` fallback.
+pub fn socket_path() -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
+    let name = env!("CARGO_PKG_NAME");
+    Some(
+        PathBuf::from(runtime)
+            .join(name)
+            .join(format!("{name}.sock")),
+    )
 }
 
 /// Read one newline-terminated request; EOF terminates a partial final line.

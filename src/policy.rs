@@ -605,6 +605,7 @@ mod tests {
         SliceStats {
             memory_current: current,
             inactive_file: inactive,
+            pids_current: 0,
             cpu_pressure: Some(crate::cgroup::Psi {
                 some_avg10: cpu,
                 full_avg10: None,
@@ -1020,6 +1021,8 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             *lcg >> 33
         };
+        // L11: these paths must actually run, not hold by construction.
+        let (mut brake_off, mut unclamp, mut queue_admits) = (0_u32, 0_u32, 0_u32);
 
         for sequence in 0..10_000_u32 {
             let mut state = State::default();
@@ -1045,9 +1048,7 @@ mod tests {
                 run += 1;
 
                 let target = if high {
-                    margin
-                        .saturating_mul(3)
-                        .saturating_add(next(&mut lcg) % (1024 * 1024))
+                    config.pool_memory_max.0
                 } else {
                     next(&mut lcg) % margin.max(1)
                 };
@@ -1063,6 +1064,11 @@ mod tests {
                 let actions = decide(&snapshot, &mut state, &config, now);
 
                 for write in writes(&actions) {
+                    match write.event {
+                        WriteEvent::BrakeOff => brake_off += 1,
+                        WriteEvent::Unclamp => unclamp += 1,
+                        _ => {}
+                    }
                     if write.knob == Knob::MemoryHigh {
                         assert_ne!(
                             write.class,
@@ -1116,19 +1122,28 @@ mod tests {
                         _ => {}
                     }
                 }
+                for action in &actions {
+                    if let Action::Admission(admission) = action
+                        && admission.from_queue
+                        && admission.decision == Decision::Admit
+                    {
+                        queue_admits += 1;
+                    }
+                }
                 state.apply(&actions, now);
 
                 if tick_index == admit_tick {
-                    let admission = admit(
-                        &snapshot,
-                        &state,
-                        &config,
-                        &batch_request(1 + next(&mut lcg) % (4 * GIB)),
-                        now,
-                    );
+                    // A distinct unit, so this admission cannot alias the queued one (L11).
+                    let mut request = batch_request(1 + next(&mut lcg) % (4 * GIB));
+                    request.unit = format!("slicewise-batch-{sequence}-{tick_index}.service");
+                    let admission = admit(&snapshot, &state, &config, &request, now);
                     state.apply(&[Action::Admission(admission)], now);
                 }
             }
         }
+        assert!(
+            brake_off > 0 && unclamp > 0 && queue_admits > 0,
+            "brake_off={brake_off} unclamp={unclamp} queue_admits={queue_admits}"
+        );
     }
 }

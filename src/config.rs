@@ -5,8 +5,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
+use serde::{Deserialize, Serialize};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const GIB: u64 = 1 << 30;
@@ -64,17 +64,18 @@ fn invalid_size(text: &str) -> String {
     format!("invalid size {text:?}: expected bytes or a K/M/G/T suffix")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     Interactive,
+    /// design: §5.2 — normal is the default class.
+    #[default]
     Normal,
     Batch,
 }
 
 impl Class {
     pub const ALL: [Class; 3] = [Class::Interactive, Class::Normal, Class::Batch];
-
     pub fn index(self) -> usize {
         match self {
             Class::Interactive => 0,
@@ -275,12 +276,24 @@ impl Config {
         if self.pool_memory_max.0 == 0 {
             // design: §7 — unset/0 means (MemTotal - system_reserve) * 3/4.
             self.pool_memory_max = Size(mem_total.saturating_sub(self.system_reserve.0) / 4 * 3);
+            // design: §7 — a resolved zero cap would render a zero MemoryMax (L10).
+            if self.pool_memory_max.0 == 0 {
+                return invalid("pool_memory_max = 0: MemTotal must be > system_reserve");
+            }
         }
         self.validate(mem_total)?;
         Ok(self)
     }
 
-    pub fn validate(&self, mem_total: u64) -> Result<(), String> {
+    /// The config file if there is one, else the resolved defaults (§7).
+    pub fn load_or_default(mem_total: u64) -> Result<Self, String> {
+        match discover_path() {
+            Some(path) if path.exists() => Self::load(&path, mem_total),
+            _ => Self::default().resolve(mem_total),
+        }
+    }
+
+    fn validate(&self, mem_total: u64) -> Result<(), String> {
         // design: §7 — the tick drives tick-count hysteresis, so cap it at 10 s.
         if !(1..=10).contains(&self.tick_secs) {
             return invalid(format!("tick_secs = {}: must be 1..=10", self.tick_secs));
@@ -457,6 +470,8 @@ mod tests {
         assert_eq!(small.pool_memory_max, Size(3 << 29));
         let large = Config::default().resolve(64 << 30).unwrap();
         assert_eq!(large.pool_memory_max, Size(93 << 29));
+        let error = Config::default().resolve(1 << 30).unwrap_err();
+        assert!(error.contains("pool_memory_max = 0"), "{error}");
     }
 
     #[test]

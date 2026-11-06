@@ -2,12 +2,80 @@
 //! Every call has a deadline so a hung manager cannot freeze the caller.
 
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::policy::{Knob, Write};
 
 pub const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 pub const SYSTEMD_RUN_DEADLINE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(10);
+
+/// design: §11 — `Real` spawns systemctl; `Record` stores the argv for fake-cgroup tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Real,
+    Record,
+}
+
+#[derive(Debug)]
+pub struct Runner {
+    mode: Mode,
+    recorded: Mutex<Vec<Vec<String>>>,
+}
+
+impl Runner {
+    pub fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            recorded: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn real() -> Self {
+        Self::new(Mode::Real)
+    }
+
+    pub fn record() -> Self {
+        Self::new(Mode::Record)
+    }
+
+    fn call(&self, args: &[&str]) -> Result<String, String> {
+        if self.mode == Mode::Record {
+            let argv = args.iter().map(|arg| (*arg).to_string()).collect();
+            self.recorded.lock().unwrap().push(argv);
+            return Ok(String::new());
+        }
+        systemctl(args)
+    }
+
+    pub fn set_property(&self, unit: &str, property: &str) -> Result<String, String> {
+        self.call(&["--user", "set-property", "--runtime", unit, property])
+    }
+
+    pub fn revert(&self, unit: &str) -> Result<String, String> {
+        self.call(&["--user", "revert", unit])
+    }
+
+    pub fn show(&self, unit: &str, property: &str) -> Result<String, String> {
+        self.call(&["--user", "show", "--value", "-p", property, unit])
+    }
+
+    pub fn recorded(&self) -> Vec<Vec<String>> {
+        self.recorded.lock().unwrap().clone()
+    }
+}
+
+/// The `set-property` value for one policy write; `None` is `infinity` (design §5.4).
+pub fn write_property(write: &Write) -> String {
+    match (write.knob, write.to) {
+        (Knob::CpuQuota, Some(percent)) => format!("CPUQuota={percent}%"),
+        (Knob::CpuQuota, None) => "CPUQuota=infinity".to_string(),
+        (Knob::MemoryHigh, Some(bytes)) => format!("MemoryHigh={bytes}"),
+        (Knob::MemoryHigh, None) => "MemoryHigh=infinity".to_string(),
+    }
+}
 
 pub fn systemctl(args: &[&str]) -> Result<String, String> {
     run("systemctl", args, SYSTEMCTL_DEADLINE)
