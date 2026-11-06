@@ -139,6 +139,7 @@ The loop runs every `tick_secs` (default 2). It reads a snapshot, calls `policy:
 - For the pool and class slices: `memory.current`, `memory.stat` (`inactive_file`), `cpu.pressure`, `memory.pressure`.
 - `cpu.pressure` of the protected units, from the `some avg10` field of each `*.pressure` file.
 - `/sys/devices/system/cpu/online`.
+- For each reserved unit, `memory.current − inactive_file` of `<pool>/<class slice>/<unit>`, probing the three class slices. ENOENT in all three means the unit is not running; any other read error keeps the last value and logs `event=error`.
 
 **Headroom:**
 ```
@@ -205,8 +206,8 @@ Live adjustment through a daemon-owned jobserver FIFO is in the backlog (§4).
 - **Daemon crash, kill or stop.** `slicewise.service` has `ExecStopPost=slicewise reset`. `reset` runs `systemctl --user revert` on the three class slices only, never the pool or protected units. It removes the runtime drop-ins and restores the unit-file values, which means no brake and no clamp (verified in M0). `reset` judges success by exit status alone; anything systemctl prints is informational. systemd runs `ExecStopPost` on failure too, then restarts the daemon (`Restart=on-failure`, `RestartSec=5`), which reconciles from cgroupfs. Workloads keep running throughout, and the hard limits never depended on the daemon.
 - **No daemon at launch.** The wrapper decides locally with no queue, prints `slicewise: daemon unreachable, launching with static defaults` to stderr, and execs. The orchestrator is never blocked by slicewise being absent.
 - **Daemon dies while a wrapper waits in the queue.** The wrapper sees end-of-file and launches with the warning above.
-- **Bad config.** The daemon exits with code 78. `ExecStopPost` reverts, wrappers fail open, and `slicewise check-config` shows the error.
-- **Missing delegation.** At startup the daemon checks that the manager root's `cgroup.subtree_control` contains `cpu` and `memory`. If not, it exits 78 with a message naming the missing controller.
+- **Bad config.** The daemon exits with code 78 (`RestartPreventExitStatus=78` stops the restart loop). `ExecStopPost` reverts, wrappers fail open, and `slicewise check-config` shows the error. `run` warns `slicewise: config error, launching with static defaults` and continues on `Config::default()`. `reset` uses the parsed config's `pool_slice` without validation, falling back to the default name, so it still reverts.
+- **Missing delegation.** At startup the daemon takes the `user@….service` ancestor of its own cgroup (from `/proc/self/cgroup`) as the manager root and checks that its `cgroup.subtree_control` contains `cpu` and `memory`. If there is no such ancestor or a controller is missing, it exits 78 naming the problem.
 
 ## 6. Orchestrator interface
 
@@ -224,12 +225,12 @@ slicewise units <DIR>           # write the static-frame unit files + protected 
 
 `run` adds `--user --slice=<class slice> -p OOMPolicy=kill`, one `--setenv=<VAR>=<jobs>` per `jobs_env` entry, and `--unit=slicewise-<class>-<pid>-<n>` if the caller gave no `--unit`. For a service it also adds `-p OOMScoreAdjust=<n>`. Scopes reject that property (M0). So when the `systemd-run` options before the command include `--scope`, `run` instead raises its own `/proc/self/oom_score_adj` to `<n>` before `exec`, and the scope inherits it. It only ever raises; if the write fails it warns on stderr and launches anyway. Everything else is passed to `systemd-run` verbatim as argv, never through a shell. That includes `--wait`, `--pipe`, `--scope` and `-p` properties.
 
-`run` refuses a caller-supplied `--slice`, `--system`, `-M` or `-H` with exit code 64. Its exit code is `systemd-run`'s, through `exec`, except 75 (`EX_TEMPFAIL`) for `--no-queue` when the work would queue, 64 for usage errors and 78 for config errors.
+`run` refuses a caller-supplied `--slice`, `--system`, `-M`/`--machine` or `-H`/`--host` with exit code 64; options that take a separate value (e.g. `-p NAME=VALUE`, `-u NAME`) are skipped as pairs when scanning. Its exit code is `systemd-run`'s, through `exec`, except 75 (`EX_TEMPFAIL`) when the daemon does not admit the work (`--no-queue` and it would queue, queue full, or it can never fit), 64 for usage errors and 78 for config errors in `daemon`, `check-config` and `units`. A caller `--unit` without a suffix gets `.service` or `.scope` in the admission request only; the argv passes it verbatim.
 
 ### 6.2 Socket protocol
 
-- **Where:** `$XDG_RUNTIME_DIR/slicewise.sock`, mode 0600. If `XDG_RUNTIME_DIR` is unset, startup fails; there is no `/tmp` fallback.
-- **Framing:** one request per connection, one JSON object per line (newline-delimited), at most 64 KiB, 2 s read timeout. Sizes are bytes on the wire; the CLI accepts `3G`.
+- **Where:** `$XDG_RUNTIME_DIR/slicewise.sock`, mode 0600. If `XDG_RUNTIME_DIR` is unset, startup fails; there is no `/tmp` fallback. An existing socket owned by another uid, or one that still accepts connections, stops startup; a stale one of ours is removed before binding.
+- **Framing:** one request per connection, one JSON object per line (newline-delimited), at most 64 KiB; the whole request line must arrive within 2 s of accept (one overall deadline, not per `read()`). Replies have a 5 s write timeout. Sizes are bytes on the wire; the CLI accepts `3G`.
 - **Strictness:** requests use `deny_unknown_fields`, and `v` must be 1.
 
 Requests:
@@ -313,6 +314,7 @@ Validation after parsing checks:
 - weights in 1..=10000,
 - sizes no larger than `MemTotal`,
 - `pool_memory_max + system_reserve ≤ MemTotal`,
+- `pool_memory_max` greater than the margin (so > 512 MiB), so the pool's static `MemoryHigh` is always positive,
 - unit names in the systemd character set.
 
 A parse error looks like this:
@@ -429,7 +431,7 @@ third_party/vendor/   `cargo vendor` output, committed
 third_party/ponytail/ LICENSE for the adapted agent-instruction style
 ```
 
-The target size is ≤ 1 800 non-blank lines in `src/` outside `#[cfg(test)]` modules at M1, with a daemon RSS under 10 MB and under 0.5 % of one core at a 2 s tick.
+The target size is ≤ 2 750 non-blank lines in `src/` outside `#[cfg(test)]` modules at M1 (after `cargo fmt`, counting each file up to its first `#[cfg(test)]`), with a daemon RSS under 10 MB and under 0.5 % of one core at a 2 s tick. M2 may add at most 200. A packet that exceeds its stated budget stops and asks the architect before merging. (Raised from 1 800 at the M1b review: the measured M1a core alone was 1 344.)
 
 | Crate | Version policy | Why (one line) | Weight |
 |---|---|---|---|
