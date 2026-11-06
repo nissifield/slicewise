@@ -441,17 +441,14 @@ fn explain(args: &[String]) -> Result<u8, (u8, String)> {
 fn reset() -> u8 {
     let config = reset_config();
     let runner = systemd::Runner::real();
-    let mut units = Class::ALL.map(|class| config.class_slice(class)).to_vec();
     let pool = runner
         .show(&config.pool_slice, "ControlGroup")
         .unwrap_or_default();
-    if let Some((parent, _)) = pool.trim_start_matches('/').rsplit_once('/') {
-        for unit in cgroup::list_units(Path::new(cgroup::CGROUP_ROOT), parent).unwrap_or_default() {
-            if config.adopt_class(&unit).is_some() {
-                units.push(unit);
-            }
-        }
-    }
+    let parent = pool
+        .trim_start_matches('/')
+        .rsplit_once('/')
+        .map(|(parent, _)| parent);
+    let units = reset_units(&config, parent, Path::new(cgroup::CGROUP_ROOT));
     let mut code = 0;
     for unit in units {
         if let Err(error) = runner.revert(&unit) {
@@ -460,6 +457,18 @@ fn reset() -> u8 {
         }
     }
     code
+}
+
+fn reset_units(config: &Config, parent: Option<&str>, root: &Path) -> Vec<String> {
+    let mut units = Class::ALL.map(|class| config.class_slice(class)).to_vec();
+    if let Some(parent) = parent {
+        for unit in cgroup::list_units(root, parent).unwrap_or_default() {
+            if config.adopt_class(&unit).is_some() {
+                units.push(unit);
+            }
+        }
+    }
+    units
 }
 
 /// design: §5.7 — a bad config must still revert; only the pool name matters.
@@ -751,6 +760,35 @@ mod tests {
         assert_eq!(
             files[5].1,
             "[Service]\nCPUWeight=200\nMemoryLow=2147483648\n"
+        );
+    }
+
+    #[test]
+    fn reset_selection_skips_protected_units_even_when_the_config_is_invalid() {
+        let config = Config::parse(
+            "[[protected]]\nunit = \"orch-protected.scope\"\n\
+             [[adopt]]\nmatch = \"orch-*.scope\"\nclass = \"batch\"\n",
+        )
+        .unwrap();
+        assert!(
+            config.clone().resolve(64 << 30).is_err(),
+            "the pattern matching a protected unit must fail validation"
+        );
+
+        let root = std::env::temp_dir().join(format!("slicewise-reset-{}", std::process::id()));
+        let parent = root.join("app.slice");
+        fs::create_dir_all(parent.join("orch-protected.scope")).unwrap();
+        fs::create_dir_all(parent.join("orch-worker-1.scope")).unwrap();
+        let units = reset_units(&config, Some("app.slice"), &root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            units.contains(&"orch-worker-1.scope".to_string()),
+            "{units:?}"
+        );
+        assert!(
+            !units.contains(&"orch-protected.scope".to_string()),
+            "{units:?}"
         );
     }
 }
