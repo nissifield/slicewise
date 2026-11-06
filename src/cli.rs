@@ -4,16 +4,14 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use crate::cgroup;
 use crate::config::{self, Class, Config};
 use crate::daemon;
 use crate::policy;
-use crate::proto::{self, DecisionReply, Explain, Request, Response, Status};
+use crate::proto::{self, DecisionReply, Request, Response};
 use crate::systemd;
 
 pub const EX_USAGE: u8 = 64;
@@ -24,30 +22,35 @@ const NAME: &str = env!("CARGO_PKG_NAME");
 const CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
 
 pub fn main(args: &[String]) -> u8 {
-    let Some(command) = args.first() else {
-        return usage("missing command");
+    let result = match args.split_first() {
+        None => Err((EX_USAGE, "missing command".to_string())),
+        Some((command, rest)) => match command.as_str() {
+            "--version" | "-V" => {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                Ok(0)
+            }
+            "run" => run(rest),
+            "daemon" => Ok(daemon::run()),
+            "status" => status(rest),
+            "explain" => explain(rest),
+            "reset" => Ok(reset()),
+            "check-config" => check_config(rest),
+            "units" => units(rest),
+            other => Err((EX_USAGE, format!("unknown command {other:?}"))),
+        },
     };
-    let rest = &args[1..];
-    match command.as_str() {
-        "--version" | "-V" => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-            0
+    match result {
+        Ok(code) => code,
+        Err((code, message)) => {
+            eprintln!("{NAME}: {message}");
+            if code == EX_USAGE {
+                eprintln!(
+                    "usage: {NAME} run|daemon|status|explain|reset|check-config|units [--version]"
+                );
+            }
+            code
         }
-        "run" => run(rest),
-        "daemon" => daemon::run(),
-        "status" => status(rest),
-        "explain" => explain(rest),
-        "reset" => reset(),
-        "check-config" => check_config(rest),
-        "units" => units(rest),
-        other => usage(&format!("unknown command {other:?}")),
     }
-}
-
-fn usage(message: &str) -> u8 {
-    eprintln!("{NAME}: {message}");
-    eprintln!("usage: {NAME} run|daemon|status|explain|reset|check-config|units [--version]");
-    EX_USAGE
 }
 
 fn mem_total() -> Result<u64, String> {
@@ -84,21 +87,14 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         }
         match option {
             "--class" => {
-                index += 1;
-                parsed.class = class_arg(args.get(index))?;
+                parsed.class = class_arg(next_value(args, &mut index, "--class needs a value")?)?;
             }
             "--mem-hint" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "--mem-hint needs a size".to_string())?;
+                let value = next_value(args, &mut index, "--mem-hint needs a size")?;
                 parsed.mem_hint = Some(config::parse_size(value)?);
             }
             "--jobs" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "--jobs needs a number".to_string())?;
+                let value = next_value(args, &mut index, "--jobs needs a number")?;
                 let jobs: u32 = value
                     .parse()
                     .map_err(|_| format!("--jobs {value:?}: expected a number"))?;
@@ -124,13 +120,27 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     Ok(parsed)
 }
 
-fn class_arg(value: Option<&String>) -> Result<Class, String> {
-    let value = value.ok_or_else(|| "--class needs interactive, normal or batch".to_string())?;
+fn next_value<'a>(args: &'a [String], index: &mut usize, missing: &str) -> Result<&'a str, String> {
+    *index += 1;
+    args.get(*index)
+        .map(String::as_str)
+        .ok_or_else(|| missing.to_string())
+}
+
+fn class_arg(value: &str) -> Result<Class, String> {
     Class::ALL
         .into_iter()
         .find(|class| class.as_str() == value)
         .ok_or_else(|| format!("--class {value:?}: expected interactive, normal or batch"))
 }
+
+/// systemd-run options whose value is a separate argument (design §6.1).
+const VALUED: &str = "\
+    -p --property -E --setenv -u --unit --description --working-directory \
+    --uid --gid --nice --service-type --slice -M --machine -H --host \
+    --timer-property --path-property --socket-property --on-active --on-boot \
+    --on-startup --on-unit-active --on-unit-inactive --on-calendar";
+const REFUSED: &str = "--slice --system -M -H --machine --host";
 
 /// Flags `run` owns, and the caller-supplied unit name (design §6.1).
 fn check_passthrough(passthrough: &[String]) -> Result<(bool, Option<String>), String> {
@@ -138,34 +148,29 @@ fn check_passthrough(passthrough: &[String]) -> Result<(bool, Option<String>), S
     let mut index = 0;
     while index < passthrough.len() {
         let arg = passthrough[index].as_str();
-        if arg == "--" {
-            break;
-        }
         // systemd-run stops option parsing at the first non-option (the command).
-        if !arg.starts_with('-') {
+        if arg == "--" || !arg.starts_with('-') {
             break;
         }
-        for (flag, why) in [
-            ("--slice", "--slice is set by slicewise"),
-            ("--system", "--system is not supported"),
-            ("-M", "-M is not supported"),
-            ("-H", "-H is not supported"),
-        ] {
-            if arg == flag
+        if REFUSED.split(' ').any(|flag| {
+            arg == flag
                 || arg.starts_with(&format!("{flag}="))
                 || (flag.len() == 2 && arg.starts_with(flag))
-            {
-                return Err(why.to_string());
-            }
+        }) {
+            return Err(format!("{arg} is set by slicewise or not supported"));
         }
         if arg == "--scope" {
             scope = true;
         }
-        if arg == "--unit" {
+        if arg == "--unit" || arg == "-u" {
             index += 1;
             unit = passthrough.get(index).cloned();
         } else if let Some(value) = arg.strip_prefix("--unit=") {
             unit = Some(value.to_string());
+        } else if arg.len() > 2 && arg.starts_with("-u") {
+            unit = Some(arg[2..].to_string());
+        } else if VALUED.split(' ').any(|flag| flag == arg) {
+            index += 1;
         }
         index += 1;
     }
@@ -177,14 +182,10 @@ fn request_unit(class: Class, scope: bool, given: Option<String>) -> (String, bo
     match given {
         Some(name) if config::valid_unit_name(&name) => (name, false),
         Some(name) => (format!("{name}.{suffix}"), false),
-        None => (
-            format!(
-                "{NAME}-{}-{}-1.{suffix}",
-                class.as_str(),
-                std::process::id()
-            ),
-            true,
-        ),
+        None => {
+            let id = std::process::id();
+            (format!("{NAME}-{}-{id}-1.{suffix}", class.as_str()), true)
+        }
     }
 }
 
@@ -203,16 +204,18 @@ fn systemd_run_args(
         "-p".to_string(),
         "OOMPolicy=kill".to_string(),
     ];
-    for name in &config.jobs_env {
-        argv.push(format!("--setenv={name}={jobs}"));
-    }
+    argv.extend(
+        config
+            .jobs_env
+            .iter()
+            .map(|name| format!("--setenv={name}={jobs}")),
+    );
     if add_unit {
         argv.push(format!("--unit={unit}"));
     }
     // design: §6.1 — scopes reject OOMScoreAdjust; the wrapper raises its own instead.
     if !scope && let Some(adjust) = config.classes.oom_score_adj(class) {
-        argv.push("-p".to_string());
-        argv.push(format!("OOMScoreAdjust={adjust}"));
+        argv.extend(["-p".to_string(), format!("OOMScoreAdjust={adjust}")]);
     }
     argv.extend(passthrough.iter().cloned());
     argv
@@ -224,67 +227,58 @@ enum Ask {
     Unavailable,
 }
 
+const NOT_ADMITTED: &str = "not admitted";
+
 fn ask(request: &Request) -> Ask {
-    let Ok(mut client) = Client::connect() else {
+    let Ok(mut reader) = connect() else {
         return Ask::Unavailable;
     };
-    if client.send(request).is_err() {
+    if send(&mut reader, request).is_err() {
         return Ask::Unavailable;
     }
-    let response = match client.receive() {
-        Ok(response) if response.ok => response,
-        _ => return Ask::Unavailable,
+    let Ok(response) = receive(&mut reader) else {
+        return Ask::Unavailable;
     };
+    if !response.ok {
+        return Ask::Unavailable;
+    }
     match response.decision {
         Some(DecisionReply::Admit) => Ask::Admitted(response.jobs.unwrap_or(1)),
         Some(DecisionReply::Queued) => {
-            client.wait();
-            match client.receive() {
+            reader.get_mut().set_read_timeout(None).ok();
+            match receive(&mut reader) {
                 Ok(admitted) if admitted.decision == Some(DecisionReply::Admit) => {
                     Ask::Admitted(admitted.jobs.unwrap_or(1))
                 }
-                Ok(rejected) => Ask::Rejected(
-                    rejected
-                        .reason
-                        .unwrap_or_else(|| "not admitted".to_string()),
-                ),
+                Ok(rejected) => {
+                    Ask::Rejected(rejected.reason.unwrap_or_else(|| NOT_ADMITTED.to_string()))
+                }
                 Err(_) => Ask::Unavailable,
             }
         }
-        _ => Ask::Rejected(
-            response
-                .reason
-                .unwrap_or_else(|| "not admitted".to_string()),
-        ),
+        _ => Ask::Rejected(response.reason.unwrap_or_else(|| NOT_ADMITTED.to_string())),
     }
 }
 
-fn run(args: &[String]) -> u8 {
-    let parsed = match parse_run(args) {
-        Ok(parsed) => parsed,
-        Err(message) => return usage(&message),
-    };
-    let (scope, given) = match check_passthrough(&parsed.passthrough) {
-        Ok(found) => found,
-        Err(message) => return usage(&message),
-    };
-    let mem_total = match mem_total() {
-        Ok(bytes) => bytes,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
-    if parsed.mem_hint.is_some_and(|hint| hint > mem_total) {
-        return usage("--mem-hint must be <= MemTotal");
+fn run(args: &[String]) -> Result<u8, (u8, String)> {
+    let parsed = parse_run(args).map_err(|message| (EX_USAGE, message))?;
+    let (scope, given) =
+        check_passthrough(&parsed.passthrough).map_err(|message| (EX_USAGE, message))?;
+    let mem_total = mem_total().ok();
+    if let Some(total) = mem_total
+        && parsed.mem_hint.is_some_and(|hint| hint > total)
+    {
+        return Err((EX_USAGE, "--mem-hint must be <= MemTotal".to_string()));
     }
-    let config = match Config::load_or_default(mem_total) {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
+    let config = mem_total
+        .and_then(|total| Config::load_or_default(total).ok())
+        .unwrap_or_else(|| {
+            // design: §5.7 — a bad config never blocks a launch.
+            eprintln!("{NAME}: config error, launching with static defaults");
+            mem_total.map_or_else(Config::default, |total| {
+                Config::default().resolve(total).unwrap_or_default()
+            })
+        });
     let (unit, add_unit) = request_unit(parsed.class, scope, given);
     let request = Request::Admit {
         v: 1,
@@ -296,10 +290,7 @@ fn run(args: &[String]) -> u8 {
     };
     let jobs = match ask(&request) {
         Ask::Admitted(jobs) => jobs,
-        Ask::Rejected(reason) => {
-            eprintln!("{NAME}: {reason}");
-            return EX_TEMPFAIL;
-        }
+        Ask::Rejected(reason) => return Err((EX_TEMPFAIL, reason)),
         Ask::Unavailable => {
             // design: §5.7 — fail open for launch; the orchestrator is never blocked.
             eprintln!("{NAME}: daemon unreachable, launching with static defaults");
@@ -318,9 +309,8 @@ fn run(args: &[String]) -> u8 {
         scope,
         &parsed.passthrough,
     );
-    let error = Command::new("systemd-run").args(&argv).exec();
-    eprintln!("{NAME}: cannot exec systemd-run: {error}");
-    127
+    let error = systemd::exec_systemd_run(&argv);
+    Err((127, format!("cannot exec systemd-run: {error}")))
 }
 
 fn local_jobs(config: &Config, parsed: &RunArgs) -> u32 {
@@ -353,87 +343,75 @@ fn raise_own_oom(target: i32) {
     }
 }
 
-fn status(args: &[String]) -> u8 {
+fn query(request: &Request) -> Result<Response, (u8, String)> {
+    let unavailable = || (EX_UNAVAILABLE, "daemon unreachable".to_string());
+    let mut reader = connect().map_err(|_| unavailable())?;
+    send(&mut reader, request).map_err(|_| unavailable())?;
+    let response = receive(&mut reader).map_err(|_| unavailable())?;
+    if response.ok {
+        Ok(response)
+    } else {
+        Err((
+            EX_USAGE,
+            response
+                .detail
+                .unwrap_or_else(|| "daemon rejected the request".to_string()),
+        ))
+    }
+}
+
+fn status(args: &[String]) -> Result<u8, (u8, String)> {
     let mut json = false;
     for arg in args {
         if arg == "--json" {
             json = true;
         } else {
-            return usage(&format!("status: unexpected {arg:?}"));
+            return Err((EX_USAGE, format!("status: unexpected {arg:?}")));
         }
     }
-    let config = match load_config() {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
-    let online = Client::connect().and_then(|mut client| {
-        client.send(&Request::Status { v: 1 })?;
-        client.receive()
-    });
-    let status = match online {
-        Ok(response) if response.ok => match response.status {
-            Some(status) => status,
-            None => return 1,
-        },
-        _ => {
+    let config = load_config().map_err(|message| (EX_CONFIG, message))?;
+    let response = match query(&Request::Status { v: 1 }) {
+        Ok(response) => response,
+        Err((EX_UNAVAILABLE, _)) => {
             // design: §8 — unreachable exits 3 and shows the cgroupfs view only.
             eprintln!("{NAME}: daemon unreachable, showing cgroupfs only");
             let mut sampler = daemon::Sampler::new(daemon::Paths::default());
             let snapshot = sampler.snapshot(Duration::ZERO, &systemd::Runner::real(), &config, &[]);
-            let status = daemon::status(
-                &snapshot,
-                &policy::State::default(),
-                &config,
-                Duration::ZERO,
-            );
-            print_status(&status, json);
-            return EX_UNAVAILABLE;
+            let state = policy::State::default();
+            let status = daemon::status(&snapshot, &state, &config, Duration::ZERO);
+            print_json(&status, json);
+            return Ok(EX_UNAVAILABLE);
         }
+        Err(error) => return Err(error),
     };
-    print_status(&status, json);
-    0
+    let Some(status) = response.status else {
+        return Ok(1);
+    };
+    print_json(&status, json);
+    Ok(0)
 }
 
-fn print_status(status: &Status, json: bool) {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(status).unwrap_or_else(|_| "null".to_string())
-        );
-        return;
+fn print_value(prefix: &str, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .for_each(|(key, value)| print_value(&format!("{prefix}{key} "), value)),
+        serde_json::Value::Array(items) => {
+            items.iter().for_each(|item| print_value(prefix, item));
+        }
+        value => println!("{prefix}{value}"),
     }
-    println!(
-        "pool cap {} working_set {} headroom {} margin {}",
-        status.cap, status.working_set, status.headroom, status.margin
-    );
-    for row in &status.classes {
-        println!(
-            "class {} memory {} memory_high {} cpu_quota {} cpu_psi {:.1} memory_psi {:.1} tasks {} brake_secs {} clamp_secs {}",
-            row.class.as_str(),
-            row.memory,
-            limit(row.memory_high),
-            limit(row.cpu_quota),
-            row.cpu_psi,
-            row.memory_psi,
-            row.pids,
-            limit(row.brake_secs),
-            limit(row.clamp_secs),
-        );
-    }
-    for row in &status.protected {
-        println!("protected {} cpu_psi {:.1}", row.unit, row.cpu_psi);
-    }
-    println!("queue {}", status.queue);
 }
 
-fn limit(value: Option<u64>) -> String {
-    value.map_or_else(|| "infinity".to_string(), |value| value.to_string())
+fn print_json<T: serde::Serialize>(value: &T, raw: bool) {
+    match serde_json::to_value(value) {
+        Ok(value) if raw => println!("{value}"),
+        Ok(value) => print_value("", &value),
+        Err(_) => println!("null"),
+    }
 }
 
-fn explain(args: &[String]) -> u8 {
+fn explain(args: &[String]) -> Result<u8, (u8, String)> {
     let mut json = false;
     let mut target = None;
     for arg in args {
@@ -442,77 +420,26 @@ fn explain(args: &[String]) -> u8 {
         } else if target.is_none() {
             target = Some(arg.clone());
         } else {
-            return usage("explain takes exactly one unit or class");
+            return Err((
+                EX_USAGE,
+                "explain takes exactly one unit or class".to_string(),
+            ));
         }
     }
     let Some(target) = target else {
-        return usage("explain needs a unit or class");
+        return Err((EX_USAGE, "explain needs a unit or class".to_string()));
     };
-    let online = Client::connect().and_then(|mut client| {
-        client.send(&Request::Explain {
-            v: 1,
-            target: target.clone(),
-        })?;
-        client.receive()
-    });
-    match online {
-        Ok(response) if response.ok => match response.explain {
-            Some(explain) => {
-                print_explain(&explain, json);
-                0
-            }
-            None => 1,
-        },
-        _ => {
-            eprintln!("{NAME}: daemon unreachable");
-            EX_UNAVAILABLE
-        }
-    }
-}
-
-fn print_explain(explain: &Explain, json: bool) {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(explain).unwrap_or_else(|_| "null".to_string())
-        );
-        return;
-    }
-    println!(
-        "target {} class {} slice {}",
-        explain.target,
-        explain.class.map_or("-", Class::as_str),
-        explain.slice.as_deref().unwrap_or("-")
-    );
-    for event in &explain.events {
-        println!(
-            "-{}s {} {} unit={}",
-            event.age_secs,
-            event.event,
-            event.reason,
-            event.unit.as_deref().unwrap_or("-")
-        );
-    }
-    if let Some(current) = &explain.current {
-        println!(
-            "now memory {} CPUQuota {} cpu_psi {:.1} memory_psi {:.1}",
-            current.memory,
-            limit(current.cpu_quota),
-            current.cpu_psi,
-            current.memory_psi
-        );
-    }
+    let response = query(&Request::Explain { v: 1, target })?;
+    let Some(explain) = response.explain else {
+        return Ok(1);
+    };
+    print_json(&explain, json);
+    Ok(0)
 }
 
 /// design: §5.7 — revert the three class slices only, success by exit status alone.
 fn reset() -> u8 {
-    let config = match load_config() {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
+    let config = reset_config();
     let runner = systemd::Runner::real();
     let mut code = 0;
     for class in Class::ALL {
@@ -524,182 +451,124 @@ fn reset() -> u8 {
     code
 }
 
-fn check_config(args: &[String]) -> u8 {
-    if args.len() > 1 {
-        return usage("check-config takes at most one path");
-    }
-    let mem_total = match mem_total() {
-        Ok(bytes) => bytes,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
+/// design: §5.7 — a bad config must still revert; only the pool name matters.
+fn reset_config() -> Config {
+    let Some(path) = config::discover_path().filter(|path| path.exists()) else {
+        return Config::default();
     };
+    match fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| Config::parse(&text).ok())
+    {
+        Some(config) if config::valid_unit_name(&config.pool_slice) => config,
+        _ => {
+            eprintln!("{NAME}: config error, using the default pool name");
+            Config::default()
+        }
+    }
+}
+
+fn check_config(args: &[String]) -> Result<u8, (u8, String)> {
+    if args.len() > 1 {
+        return Err((EX_USAGE, "check-config takes at most one path".to_string()));
+    }
+    let mem_total = mem_total().map_err(|message| (EX_CONFIG, message))?;
     let config = match args.first() {
         Some(path) => Config::load(Path::new(path), mem_total),
         None => Config::load_or_default(mem_total),
-    };
-    let config = match config {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
-    println!("tick_secs = {}", config.tick_secs);
-    println!("pool_slice = {}", config.pool_slice);
-    println!("pool_memory_max = {}", config.pool_memory_max.0);
-    println!("system_reserve = {}", config.system_reserve.0);
-    println!("reserve_cpus = {}", config.reserve_cpus);
-    println!("mem_per_job = {}", config.mem_per_job.0);
-    for class in Class::ALL {
-        println!(
-            "class.{}.cpu_weight = {}",
-            class.as_str(),
-            config.classes.cpu_weight(class)
-        );
-        println!(
-            "class.{}.default_mem = {}",
-            class.as_str(),
-            config.classes.default_mem(class).0
-        );
-        if let Some(adjust) = config.classes.oom_score_adj(class) {
-            println!("class.{}.oom_score_adj = {adjust}", class.as_str());
-        }
     }
-    for protected in &config.protected {
-        println!(
-            "protected.unit = {} cpu_weight = {} memory_low = {}",
-            protected.unit, protected.cpu_weight, protected.memory_low.0
-        );
-    }
-    0
+    .map_err(|message| (EX_CONFIG, message))?;
+    println!("{config:#?}");
+    Ok(0)
 }
 
-fn units(args: &[String]) -> u8 {
+fn units(args: &[String]) -> Result<u8, (u8, String)> {
     if args.len() != 1 {
-        return usage("units takes exactly one directory");
+        return Err((EX_USAGE, "units takes exactly one directory".to_string()));
     }
-    let config = match load_config() {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return EX_CONFIG;
-        }
-    };
-    let binary = match std::env::current_exe() {
-        Ok(binary) => binary,
-        Err(error) => {
-            eprintln!("{NAME}: cannot find own binary: {error}");
-            return 1;
-        }
-    };
+    let config = load_config().map_err(|message| (EX_CONFIG, message))?;
+    let binary =
+        std::env::current_exe().map_err(|error| (1, format!("cannot find own binary: {error}")))?;
     let online = cgroup::online_cpus(Path::new(CPU_ONLINE)).unwrap_or(config.reserve_cpus.max(1));
     for (name, text) in unit_files(&config, online, &binary) {
         let path = Path::new(&args[0]).join(name);
-        if let Some(parent) = path.parent()
-            && let Err(error) = fs::create_dir_all(parent)
-        {
-            eprintln!("{NAME}: cannot create {}: {error}", parent.display());
-            return 1;
-        }
-        if let Err(error) = fs::write(&path, text) {
-            eprintln!("{NAME}: cannot write {}: {error}", path.display());
-            return 1;
+        let written = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&path, text));
+        if let Err(error) = written {
+            return Err((1, format!("cannot write {}: {error}", path.display())));
         }
         println!("{}", path.display());
     }
-    0
+    Ok(0)
 }
 
 /// The static frame (design §5.2, §5.3): text only; the caller writes it.
 fn unit_files(config: &Config, online_cpus: u32, binary: &Path) -> Vec<(String, String)> {
     let mut files = Vec::new();
-    let mut pool = format!("[Unit]\nDescription={NAME} pool\n\n[Slice]\nCPUWeight=100\n");
     let quotable = online_cpus.saturating_sub(config.reserve_cpus);
-    if config.reserve_cpus > 0 && quotable > 0 {
-        pool.push_str(&format!("CPUQuota={}%\n", quotable * 100));
-    }
-    pool.push_str(&format!("MemoryMax={}\n", config.pool_memory_max.0));
+    let quota = if config.reserve_cpus > 0 && quotable > 0 {
+        format!("CPUQuota={}%\n", quotable * 100)
+    } else {
+        String::new()
+    };
     let high = config
         .pool_memory_max
         .0
         .saturating_sub(policy::margin(config));
-    if high > 0 {
-        pool.push_str(&format!("MemoryHigh={high}\n"));
-    }
+    let pool = format!(
+        "[Unit]\nDescription={NAME} pool\n\n[Slice]\nCPUWeight=100\n{quota}MemoryMax={}\nMemoryHigh={high}\n",
+        config.pool_memory_max.0
+    );
     files.push((config.pool_slice.clone(), pool));
     for class in Class::ALL {
-        files.push((
-            config.class_slice(class),
-            format!(
-                "[Unit]\nDescription={NAME} {} class\n\n[Slice]\nCPUWeight={}\n",
-                class.as_str(),
-                config.classes.cpu_weight(class)
-            ),
-        ));
+        let text = format!(
+            "[Unit]\nDescription={NAME} {} class\n\n[Slice]\nCPUWeight={}\n",
+            class.as_str(),
+            config.classes.cpu_weight(class)
+        );
+        files.push((config.class_slice(class), text));
     }
     files.push((
         format!("{NAME}.service"),
         format!(
-            "[Unit]\nDescription={NAME} daemon\n\n[Service]\nExecStart={0} daemon\nExecStopPost={0} reset\nRestart=on-failure\nRestartSec=5\nMemoryMax=64M\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription={NAME} daemon\n\n[Service]\nExecStart={0} daemon\nExecStopPost={0} reset\nRestart=on-failure\nRestartSec=5\nRestartPreventExitStatus=78\nMemoryMax=64M\n\n[Install]\nWantedBy=default.target\n",
             binary.display()
         ),
     ));
     for protected in &config.protected {
-        files.push((
-            format!("{}.d/10-{NAME}.conf", protected.unit),
-            format!(
-                "[Service]\nCPUWeight={}\nMemoryLow={}\n",
-                protected.cpu_weight, protected.memory_low.0
-            ),
-        ));
+        let text = format!(
+            "[Service]\nCPUWeight={}\nMemoryLow={}\n",
+            protected.cpu_weight, protected.memory_low.0
+        );
+        files.push((format!("{}.d/10-{NAME}.conf", protected.unit), text));
     }
     files
 }
 
-struct Client {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+fn connect() -> Result<BufReader<UnixStream>, String> {
+    let path = proto::socket_path().ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+    let stream = UnixStream::connect(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    Ok(BufReader::new(stream))
 }
 
-impl Client {
-    fn connect() -> Result<Self, String> {
-        let path = proto::socket_path().ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-        let stream =
-            UnixStream::connect(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
-        let reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|error| format!("{}: {error}", path.display()))?,
-        );
-        Ok(Self { stream, reader })
-    }
+fn send(reader: &mut BufReader<UnixStream>, request: &Request) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    reader
+        .get_mut()
+        .write_all(&bytes)
+        .map_err(|e| e.to_string())
+}
 
-    fn send(&mut self, request: &Request) -> Result<(), String> {
-        let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
-        self.stream
-            .write_all(&bytes)
-            .map_err(|error| error.to_string())
+fn receive(reader: &mut BufReader<UnixStream>) -> Result<Response, String> {
+    let mut line = String::new();
+    if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        return Err("daemon closed the connection".to_string());
     }
-
-    fn receive(&mut self) -> Result<Response, String> {
-        let mut line = String::new();
-        let read = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            return Err("daemon closed the connection".to_string());
-        }
-        serde_json::from_str(&line).map_err(|error| error.to_string())
-    }
-
-    fn wait(&mut self) {
-        let _ = self.reader.get_ref().set_read_timeout(None);
-    }
+    serde_json::from_str(&line).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -777,6 +646,45 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_option_values_do_not_hide_the_next_flag() {
+        let args: Vec<String> = ["-p", "CPUWeight=50", "--scope", "sleep", "1"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert!(check_passthrough(&args).unwrap().0);
+    }
+
+    #[test]
+    fn passthrough_refuses_a_slice_after_an_option_value() {
+        let args: Vec<String> = ["-p", "A=B", "--slice=x.slice", "cmd"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert!(check_passthrough(&args).is_err());
+    }
+
+    #[test]
+    fn passthrough_finds_the_short_unit_option() {
+        let args: Vec<String> = ["-u", "job", "cmd"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert_eq!(
+            check_passthrough(&args).unwrap(),
+            (false, Some("job".to_string()))
+        );
+    }
+
+    #[test]
+    fn passthrough_refuses_host_equals_form() {
+        let args: Vec<String> = ["--host=h", "cmd"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert!(check_passthrough(&args).is_err());
+    }
+
+    #[test]
     fn request_unit_generates_and_normalizes_names() {
         let (generated, add) = request_unit(Class::Batch, false, None);
         assert!(add);
@@ -827,6 +735,7 @@ mod tests {
         assert!(service.contains("ExecStopPost=/usr/bin/slicewise reset"));
         assert!(service.contains("Restart=on-failure"));
         assert!(service.contains("RestartSec=5"));
+        assert!(service.contains("RestartPreventExitStatus=78"));
         assert_eq!(
             files[5].1,
             "[Service]\nCPUWeight=200\nMemoryLow=2147483648\n"

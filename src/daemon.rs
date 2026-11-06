@@ -48,6 +48,7 @@ impl Default for Paths {
 }
 
 /// Reads the snapshot, keeping the last good value when a read fails (L14).
+#[derive(Default)]
 pub struct Sampler {
     paths: Paths,
     pool_rel: Option<String>,
@@ -64,14 +65,8 @@ impl Sampler {
     pub fn new(paths: Paths) -> Self {
         Self {
             paths,
-            pool_rel: None,
-            protected_rel: BTreeMap::new(),
-            last_pool: SliceStats::default(),
-            last_classes: [SliceStats::default(); 3],
-            last_units: BTreeMap::new(),
-            mem_available: 0,
             online_cpus: 1,
-            next_refresh: Duration::ZERO,
+            ..Self::default()
         }
     }
 
@@ -110,7 +105,9 @@ impl Sampler {
                 match cgroup::slice_stats(&root, &rel) {
                     Ok(stats) => self.last_classes[class.index()] = stats,
                     // A class slice appears with its first unit; missing is normal.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.last_classes[class.index()] = SliceStats::default();
+                    }
                     Err(error) => self.log_error(&rel, &error),
                 }
             }
@@ -123,17 +120,18 @@ impl Sampler {
             Ok(cpus) => self.online_cpus = cpus,
             Err(error) => self.log_error("online_cpus", &error),
         }
-        let mut protected_cpu_pressure = Vec::with_capacity(config.protected.len());
-        for protected in &config.protected {
-            let psi = self.protected_psi(&root, runner, &protected.unit, refresh);
-            protected_cpu_pressure.push(psi);
-        }
-        let mut map = BTreeMap::new();
-        for unit in units {
-            if let Some(working_set) = self.unit_ws(&root, config, unit) {
-                map.insert(unit.clone(), working_set);
-            }
-        }
+        let protected_cpu_pressure = config
+            .protected
+            .iter()
+            .map(|protected| self.protected_psi(&root, runner, &protected.unit, refresh))
+            .collect();
+        let map = units
+            .iter()
+            .filter_map(|unit| {
+                self.unit_ws(&root, config, unit)
+                    .map(|working_set| (unit.clone(), working_set))
+            })
+            .collect();
         Snapshot {
             mem_available: self.mem_available,
             online_cpus: self.online_cpus,
@@ -175,18 +173,17 @@ impl Sampler {
                 Err(error) => last_error = Some(error),
             }
         }
-        if let Some(error) = last_error {
+        last_error.and_then(|error| {
             self.log_error(unit, &error);
-            return self.last_units.get(unit).copied();
-        }
-        None
+            self.last_units.get(unit).copied()
+        })
     }
 
     fn log_error(&self, target: &str, error: &impl std::fmt::Display) {
-        let reason = error.to_string();
-        eprintln!(
-            "{}",
-            log::line("warn", "error", &[("target", target), ("reason", &reason)])
+        log::emit(
+            "warn",
+            "error",
+            &[("target", target), ("reason", &error.to_string())],
         );
     }
 }
@@ -201,21 +198,12 @@ fn read_working_set(root: &Path, rel: &str) -> io::Result<u64> {
     Ok(current.saturating_sub(inactive))
 }
 
-#[derive(Default)]
-struct Record {
-    at: Duration,
-    event: String,
-    unit: Option<String>,
-    class: Option<Class>,
-    reason: String,
-}
-
 /// All mutable daemon state; the loop and the connection threads share it.
 #[derive(Default)]
 pub struct Daemon {
     state: State,
     snapshot: Snapshot,
-    events: VecDeque<Record>,
+    events: VecDeque<(Duration, Option<Class>, Event)>,
     /// Units the loop has admitted from the queue, waiting for their wrapper (jobs, reason).
     admitted: Vec<(String, Duration, u32, String)>,
     over_budget: bool,
@@ -233,13 +221,13 @@ impl Daemon {
         if self.events.len() == EVENT_CAP {
             self.events.pop_front();
         }
-        self.events.push_back(Record {
-            at: now,
+        let event = Event {
+            age_secs: 0,
             event: event.to_string(),
             unit: unit.map(str::to_string),
-            class,
             reason: reason.to_string(),
-        });
+        };
+        self.events.push_back((now, class, event));
     }
 }
 
@@ -267,15 +255,12 @@ pub fn tick(
     runner: &Runner,
     now: Duration,
 ) {
-    let units = {
-        let daemon = lock(daemon);
-        daemon
-            .state
-            .reservations
-            .iter()
-            .map(|reservation| reservation.unit.clone())
-            .collect::<Vec<_>>()
-    };
+    let units = lock(daemon)
+        .state
+        .reservations
+        .iter()
+        .map(|reservation| reservation.unit.clone())
+        .collect::<Vec<_>>();
     let snapshot = sampler.snapshot(now, runner, config, &units);
     let mut writes = Vec::new();
     {
@@ -324,66 +309,54 @@ pub fn tick(
                     &write.reason,
                 );
             }
-            Err(error) => eprintln!(
-                "{}",
-                log::line(
-                    "warn",
-                    "error",
-                    &[("target", &write.slice), ("reason", &error)]
-                )
+            Err(error) => log::emit(
+                "warn",
+                "error",
+                &[("target", &write.slice), ("reason", &error)],
             ),
         }
     }
 }
 
 fn log_admission(admission: &Admission) {
-    let need = admission.need.to_string();
-    let jobs = admission.jobs.to_string();
-    let level = if admission.decision == Decision::Admit {
-        "info"
-    } else {
-        "warn"
-    };
-    eprintln!(
-        "{}",
-        log::line(
-            level,
-            admission.event(),
-            &[
-                ("unit", &admission.request.unit),
-                ("class", admission.request.class.as_str()),
-                ("need", &need),
-                ("jobs", &jobs),
-                ("reason", &admission.reason),
-            ]
-        )
+    log::emit(
+        if admission.decision == Decision::Admit {
+            "info"
+        } else {
+            "warn"
+        },
+        admission.event(),
+        &[
+            ("unit", &admission.request.unit),
+            ("class", admission.request.class.as_str()),
+            ("need", &admission.need.to_string()),
+            ("jobs", &admission.jobs.to_string()),
+            ("reason", &admission.reason),
+        ],
     );
 }
 
 fn log_write(write: &PolicyWrite) {
-    let from = write
-        .from
-        .map_or_else(|| "infinity".to_string(), |v| v.to_string());
-    let to = write
-        .to
-        .map_or_else(|| "infinity".to_string(), |v| v.to_string());
     let knob = match write.knob {
         Knob::MemoryHigh => "MemoryHigh",
         Knob::CpuQuota => "CPUQuota",
     };
-    eprintln!(
-        "{}",
-        log::line(
-            "info",
-            write.event.as_str(),
-            &[
-                ("target", &write.slice),
-                ("knob", knob),
-                ("from", &from),
-                ("to", &to),
-                ("reason", &write.reason),
-            ]
-        )
+    log::emit(
+        "info",
+        write.event.as_str(),
+        &[
+            ("target", &write.slice),
+            ("knob", knob),
+            (
+                "from",
+                &write.from.map_or("infinity".to_string(), |v| v.to_string()),
+            ),
+            (
+                "to",
+                &write.to.map_or("infinity".to_string(), |v| v.to_string()),
+            ),
+            ("reason", &write.reason),
+        ],
     );
 }
 
@@ -402,8 +375,8 @@ pub fn status(snapshot: &Snapshot, state: &State, config: &Config, now: Duration
             .protected
             .iter()
             .zip(&snapshot.protected_cpu_pressure)
-            .map(|(protected, &cpu_psi)| ProtectedRow {
-                unit: protected.unit.clone(),
+            .map(|(p, &cpu_psi)| ProtectedRow {
+                unit: p.unit.clone(),
                 cpu_psi,
             })
             .collect(),
@@ -419,54 +392,45 @@ fn class_row(
     now: Duration,
 ) -> ClassRow {
     let stats = snapshot.class(class);
-    let since = |held: bool| {
-        if held {
-            state
-                .last_write
-                .get(&config.class_slice(class))
-                .map(|at| now.saturating_sub(*at).as_secs())
-        } else {
-            None
-        }
-    };
+    let batch = class == Class::Batch;
+    let age = state
+        .last_write
+        .get(&config.class_slice(class))
+        .map(|at| now.saturating_sub(*at).as_secs());
     ClassRow {
         class,
         memory: stats.memory_current,
         memory_high: state.memory_high[class.index()],
-        cpu_quota: state.clamp_cpus.map(|cpus| u64::from(cpus) * 100),
+        cpu_quota: state
+            .clamp_cpus
+            .filter(|_| batch)
+            .map(|cpus| u64::from(cpus) * 100),
         cpu_psi: stats.cpu_pressure.map_or(0.0, |psi| psi.some_avg10),
         memory_psi: stats.memory_pressure.map_or(0.0, |psi| psi.some_avg10),
         pids: stats.pids_current,
-        brake_secs: since(state.memory_high[class.index()].is_some()),
-        clamp_secs: if class == Class::Batch {
-            since(state.clamp_cpus.is_some())
-        } else {
-            None
-        },
+        brake_secs: state.memory_high[class.index()]
+            .is_some()
+            .then_some(age)
+            .flatten(),
+        clamp_secs: (batch && state.clamp_cpus.is_some())
+            .then_some(age)
+            .flatten(),
     }
 }
 
-fn explain(
-    daemon: &Daemon,
-    config: &Config,
-    class_hint: Option<Class>,
-    target: &str,
-    now: Duration,
-) -> Explain {
+fn explain(daemon: &Daemon, config: &Config, target: &str, now: Duration) -> Explain {
     let is_class = Class::ALL.iter().any(|class| class.as_str() == target);
     let class = Class::ALL
-        .iter()
-        .copied()
+        .into_iter()
         .find(|class| class.as_str() == target)
         .or_else(|| {
             daemon
                 .events
                 .iter()
                 .rev()
-                .find(|event| event.unit.as_deref() == Some(target))
-                .and_then(|event| event.class)
-        })
-        .or(class_hint);
+                .find(|(_, _, event)| event.unit.as_deref() == Some(target))
+                .and_then(|(_, class, _)| *class)
+        });
     Explain {
         target: target.to_string(),
         class,
@@ -474,14 +438,14 @@ fn explain(
         events: daemon
             .events
             .iter()
-            .filter(|event| {
+            .filter(|(_, event_class, event)| {
                 event.unit.as_deref() == Some(target)
                     || (class.is_some()
-                        && event.class == class
+                        && *event_class == class
                         && (is_class || event.unit.is_none()))
             })
-            .map(|event| Event {
-                age_secs: now.saturating_sub(event.at).as_secs(),
+            .map(|(at, _, event)| Event {
+                age_secs: now.saturating_sub(*at).as_secs(),
                 event: event.event.clone(),
                 unit: event.unit.clone(),
                 reason: event.reason.clone(),
@@ -491,34 +455,18 @@ fn explain(
     }
 }
 
-fn unit_class(runner: &Runner, config: &Config, unit: &str) -> Option<Class> {
-    let rel = runner.show(unit, "ControlGroup").ok()?;
-    Class::ALL
-        .into_iter()
-        .find(|class| rel.contains(&format!("/{}/", config.class_slice(*class))))
-}
-
 struct Deadline {
     stream: UnixStream,
     deadline: Instant,
 }
 
-impl Deadline {
-    fn new(stream: UnixStream, timeout: Duration) -> Self {
-        Self {
-            stream,
-            deadline: Instant::now() + timeout,
-        }
-    }
-}
-
 impl Read for Deadline {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let now = Instant::now();
-        if now >= self.deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        self.stream.set_read_timeout(Some(self.deadline - now))?;
+        let left = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        self.stream.set_read_timeout(Some(left))?;
         self.stream.read(buffer)
     }
 }
@@ -528,9 +476,8 @@ fn serve(listener: UnixListener, shared: Arc<Shared>, connections: Arc<AtomicUsi
         let Ok(stream) = stream else { continue };
         if connections.fetch_add(1, Ordering::SeqCst) >= CONNECTIONS {
             connections.fetch_sub(1, Ordering::SeqCst);
-            let mut out = &stream;
             let _ = proto::write_one(
-                &mut out,
+                &mut &stream,
                 &Response::error(
                     ErrorCode::Busy,
                     format!("more than {CONNECTIONS} connections"),
@@ -549,13 +496,15 @@ fn serve(listener: UnixListener, shared: Arc<Shared>, connections: Arc<AtomicUsi
 
 fn handle(stream: &UnixStream, shared: &Shared) -> io::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let reader = Deadline::new(stream.try_clone()?, READ_TIMEOUT);
+    let reader = Deadline {
+        stream: stream.try_clone()?,
+        deadline: Instant::now() + READ_TIMEOUT,
+    };
     let mut reader = BufReader::new(reader);
     let request = match proto::read_one(&mut reader, shared.mem_total) {
         Ok(request) => request,
         Err((code, detail)) => {
-            let mut out = stream;
-            return proto::write_one(&mut out, &Response::error(code, detail));
+            return proto::write_one(&mut &*stream, &Response::error(code, detail));
         }
     };
     let now = shared.start.elapsed();
@@ -584,18 +533,14 @@ fn handle(stream: &UnixStream, shared: &Shared) -> io::Result<()> {
                 let daemon = lock(&shared.daemon);
                 status(&daemon.snapshot, &daemon.state, &shared.config, now)
             };
-            let mut out = stream;
-            proto::write_one(&mut out, &Response::status(status))
+            proto::write_one(&mut &*stream, &Response::status(status))
         }
         Request::Explain { target, .. } => {
-            // `show` spawns systemctl, so resolve the class before taking the lock.
-            let class_hint = unit_class(&shared.runner, &shared.config, &target);
             let explain = {
                 let daemon = lock(&shared.daemon);
-                explain(&daemon, &shared.config, class_hint, &target, now)
+                explain(&daemon, &shared.config, &target, now)
             };
-            let mut out = stream;
-            proto::write_one(&mut out, &Response::explain(explain))
+            proto::write_one(&mut &*stream, &Response::explain(explain))
         }
     }
 }
@@ -642,26 +587,21 @@ fn admit(
         shared.wake.notify_all();
     }
     let queued = response.decision == Some(DecisionReply::Queued);
-    let mut out = stream;
-    proto::write_one(&mut out, &response)?;
+    proto::write_one(&mut &*stream, &response)?;
     if queued {
-        wait_for_admission(stream, shared, request.unit)?;
+        wait_for_admission(stream, shared, &request.unit)?;
     }
     Ok(())
 }
 
 /// A queued reply is followed by exactly one more line (design §6.2).
-fn wait_for_admission(stream: &UnixStream, shared: &Shared, unit: String) -> io::Result<()> {
+fn wait_for_admission(stream: &UnixStream, shared: &Shared, unit: &str) -> io::Result<()> {
+    let mut out = stream;
     loop {
         let mut daemon = lock(&shared.daemon);
-        if let Some(index) = daemon
-            .admitted
-            .iter()
-            .position(|(name, _, _, _)| name == &unit)
-        {
-            let (_, _, jobs, reason) = daemon.admitted.remove(index);
+        if let Some(index) = daemon.admitted.iter().position(|(name, ..)| name == unit) {
+            let (.., jobs, reason) = daemon.admitted.remove(index);
             drop(daemon);
-            let mut out = stream;
             return proto::write_one(&mut out, &Response::admit(jobs, reason));
         }
         if !daemon
@@ -671,27 +611,24 @@ fn wait_for_admission(stream: &UnixStream, shared: &Shared, unit: String) -> io:
             .any(|request| request.unit == unit)
         {
             drop(daemon);
-            let mut out = stream;
             return proto::write_one(
                 &mut out,
                 &Response::reject("left the queue without admission"),
             );
         }
-        let (_guard, _) = shared
+        let (guard, _) = shared
             .wake
             .wait_timeout(daemon, Duration::from_secs(1))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(guard);
     }
 }
 
 pub fn run() -> u8 {
-    match run_inner() {
-        Ok(()) => 0,
-        Err((code, message)) => {
-            eprintln!("{message}");
-            code
-        }
-    }
+    run_inner().map(|()| 0).unwrap_or_else(|(code, message)| {
+        eprintln!("{message}");
+        code
+    })
 }
 
 fn run_inner() -> Result<(), (u8, String)> {
@@ -700,13 +637,10 @@ fn run_inner() -> Result<(), (u8, String)> {
     let config = Config::load_or_default(mem_total).map_err(|error| (78, error))?;
     if config.protected.is_empty() {
         // design: §7 — every key is optional except [[protected]].
-        eprintln!(
-            "{}",
-            log::line(
-                "warn",
-                "error",
-                &[("reason", "config has no [[protected]] units")]
-            )
+        log::emit(
+            "warn",
+            "error",
+            &[("reason", "config has no [[protected]] units")],
         );
     }
     check_delegation().map_err(|error| (78, error))?;
@@ -720,13 +654,9 @@ fn run_inner() -> Result<(), (u8, String)> {
         runner: Runner::real(),
     });
     let connections = Arc::new(AtomicUsize::new(0));
-    {
-        let shared = Arc::clone(&shared);
-        let connections = Arc::clone(&connections);
-        thread::spawn(move || serve(listener, shared, connections));
-    }
+    let (shared2, connections2) = (Arc::clone(&shared), Arc::clone(&connections));
+    thread::spawn(move || serve(listener, shared2, connections2));
     let mut sampler = Sampler::new(Paths::default());
-    let period = Duration::from_secs(shared.config.tick_secs);
     loop {
         tick(
             &shared.daemon,
@@ -744,7 +674,7 @@ fn run_inner() -> Result<(), (u8, String)> {
         }
         let (_guard, _) = shared
             .wake
-            .wait_timeout(daemon, period)
+            .wait_timeout(daemon, Duration::from_secs(shared.config.tick_secs))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
@@ -773,25 +703,18 @@ fn check_delegation() -> Result<(), String> {
     Ok(())
 }
 
-/// design: §9 — a 0700 directory and a 0600 socket, never another user's file.
+/// design: §9 — a 0600 socket under the 0700 runtime dir, never another user's file.
 fn bind_socket() -> Result<UnixListener, String> {
     let path = proto::socket_path().ok_or_else(|| {
         "config error: XDG_RUNTIME_DIR is unset; there is no /tmp fallback".to_string()
     })?;
-    let dir = path
-        .parent()
-        .ok_or_else(|| "invalid socket path".to_string())?;
-    fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot chmod {}: {error}", dir.display()))?;
+    let uid = |path: &Path| {
+        fs::metadata(path)
+            .map(|meta| meta.uid())
+            .map_err(|error| format!("cannot stat {}: {error}", path.display()))
+    };
     if path.exists() {
-        let owner = fs::metadata(&path)
-            .map_err(|error| format!("cannot stat {}: {error}", path.display()))?
-            .uid();
-        let me = fs::metadata("/proc/self")
-            .map_err(|error| format!("cannot stat /proc/self: {error}"))?
-            .uid();
-        if owner != me {
+        if uid(&path)? != uid(Path::new("/proc/self"))? {
             return Err(format!(
                 "refusing to use {}: owned by another user",
                 path.display()
@@ -817,7 +740,10 @@ mod tests {
     #[test]
     fn deadline_refuses_a_dribbling_reader_after_the_overall_timeout() {
         let (left, right) = UnixStream::pair().unwrap();
-        let mut reader = Deadline::new(left, Duration::from_millis(50));
+        let mut reader = Deadline {
+            stream: left,
+            deadline: Instant::now() + Duration::from_millis(50),
+        };
         // The peer keeps the connection open and sends nothing.
         let mut buffer = [0_u8; 8];
         let error = reader.read(&mut buffer).unwrap_err();
@@ -846,12 +772,11 @@ mod tests {
         snapshot.pool.memory_current = 2 << 30;
         snapshot.classes[Class::Batch.index()].memory_current = 1 << 30;
         snapshot.classes[Class::Batch.index()].pids_current = 3;
-        let status = status(
-            &snapshot,
-            &State::default(),
-            &config,
-            Duration::from_secs(5),
-        );
+        let state = State {
+            clamp_cpus: Some(2),
+            ..State::default()
+        };
+        let status = status(&snapshot, &state, &config, Duration::from_secs(5));
         assert_eq!(status.cap, 8 << 30);
         assert_eq!(status.working_set, 2 << 30);
         assert_eq!(status.headroom, 6 << 30);
@@ -860,6 +785,8 @@ mod tests {
         assert_eq!(batch.memory, 1 << 30);
         assert_eq!(batch.pids, 3);
         assert_eq!(batch.memory_high, None);
+        assert_eq!(batch.cpu_quota, Some(200));
+        assert_eq!(status.classes[Class::Normal.index()].cpu_quota, None);
         assert_eq!(status.queue, 0);
     }
 }

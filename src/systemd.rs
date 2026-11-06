@@ -1,6 +1,8 @@
 //! The only process spawner (design §5.3, §9): argv only, never a shell.
 //! Every call has a deadline so a hung manager cannot freeze the caller.
 
+use std::io;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -17,6 +19,7 @@ const POLL: Duration = Duration::from_millis(10);
 pub enum Mode {
     Real,
     Record,
+    Fail,
 }
 
 #[derive(Debug)]
@@ -38,12 +41,17 @@ impl Runner {
     }
 
     fn call(&self, args: &[&str]) -> Result<String, String> {
-        if self.mode == Mode::Record {
-            let argv = args.iter().map(|arg| (*arg).to_string()).collect();
-            self.recorded.lock().unwrap().push(argv);
-            return Ok(String::new());
+        match self.mode {
+            Mode::Real => systemctl(args),
+            Mode::Record | Mode::Fail => {
+                let argv = args.iter().map(|arg| (*arg).to_string()).collect();
+                self.recorded.lock().unwrap().push(argv);
+                if self.mode == Mode::Fail {
+                    return Err("injected failure".to_string());
+                }
+                Ok(String::new())
+            }
         }
-        systemctl(args)
     }
 
     pub fn set_property(&self, unit: &str, property: &str) -> Result<String, String> {
@@ -79,6 +87,11 @@ pub fn systemctl(args: &[&str]) -> Result<String, String> {
 
 pub fn systemd_run(args: &[&str]) -> Result<String, String> {
     run("systemd-run", args, SYSTEMD_RUN_DEADLINE)
+}
+
+/// Replace this process with `systemd-run` (design §6.1); only returns on failure.
+pub fn exec_systemd_run(argv: &[String]) -> io::Error {
+    Command::new("systemd-run").args(argv).exec()
 }
 
 /// Returns trimmed stdout on success; on failure includes the exit status and

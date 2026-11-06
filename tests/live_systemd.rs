@@ -10,6 +10,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -158,7 +159,23 @@ impl Fixture {
     }
 
     fn socket(&self) -> PathBuf {
-        self.runtime.path().join("slicewise").join("slicewise.sock")
+        self.runtime.path().join("slicewise.sock")
+    }
+
+    /// design: §5.7 — prove the config is the test pool before any unit is touched.
+    fn assert_config(&self) {
+        let output = self.slicewise(&["check-config"]);
+        assert!(
+            output.status.success(),
+            "check-config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&self.pool),
+            "check-config does not print the test pool {}: {text}",
+            self.pool
+        );
     }
 
     fn command(&self, program: &str) -> Command {
@@ -209,6 +226,12 @@ impl Fixture {
             wait_for(Duration::from_secs(5), || socket.exists()),
             "daemon socket did not appear"
         );
+        let mode = fs::metadata(&socket)
+            .expect("stat socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "socket mode");
     }
 
     fn kill_child_daemon(&mut self) {
@@ -267,6 +290,7 @@ impl Drop for Fixture {
             let _ = mutate(&["--user", "reset-failed", unit]);
         }
         for unit in std::iter::once(&self.pool).chain(self.classes.iter()) {
+            let _ = mutate(&["--user", "revert", unit]);
             let _ = mutate(&["--user", "stop", unit]);
             let _ = mutate(&["--user", "reset-failed", unit]);
         }
@@ -284,6 +308,7 @@ fn daemon_serves_run_explain_reset_and_stop_post() {
         return;
     }
     let mut fixture = Fixture::new();
+    fixture.assert_config();
     fixture.install_units();
     fixture.start_child_daemon();
 

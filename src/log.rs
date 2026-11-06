@@ -1,7 +1,12 @@
 //! Logfmt line helper (design §8). Callers must never pass environment values.
 
+/// Print one logfmt line to stderr.
+pub fn emit(level: &str, event: &str, fields: &[(&str, &str)]) {
+    eprintln!("{}", line(level, event, fields));
+}
+
 /// `level=... event=... key=value...` with the keys in caller order.
-pub fn line(level: &str, event: &str, fields: &[(&str, &str)]) -> String {
+fn line(level: &str, event: &str, fields: &[(&str, &str)]) -> String {
     let mut out = format!("level={} event={}", quote(level), quote(event));
     for (key, value) in fields {
         out.push(' ');

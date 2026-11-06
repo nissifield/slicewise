@@ -260,15 +260,10 @@ pub struct Event {
     pub reason: String,
 }
 
-/// `$XDG_RUNTIME_DIR/<NAME>/<NAME>.sock` (design §6.2); there is no `/tmp` fallback.
+/// `$XDG_RUNTIME_DIR/slicewise.sock` (design §6.2); there is no `/tmp` fallback.
 pub fn socket_path() -> Option<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
-    let name = env!("CARGO_PKG_NAME");
-    Some(
-        PathBuf::from(runtime)
-            .join(name)
-            .join(format!("{name}.sock")),
-    )
+    Some(PathBuf::from(runtime).join(format!("{}.sock", env!("CARGO_PKG_NAME"))))
 }
 
 /// Read one newline-terminated request; EOF terminates a partial final line.

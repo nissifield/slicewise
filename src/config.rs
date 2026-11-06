@@ -77,11 +77,7 @@ pub enum Class {
 impl Class {
     pub const ALL: [Class; 3] = [Class::Interactive, Class::Normal, Class::Batch];
     pub fn index(self) -> usize {
-        match self {
-            Class::Interactive => 0,
-            Class::Normal => 1,
-            Class::Batch => 2,
-        }
+        self as usize
     }
 
     pub fn as_str(self) -> &'static str {
@@ -369,6 +365,12 @@ impl Config {
                 mem_total,
             )?;
         }
+        if self.pool_memory_max.0 <= crate::policy::margin(self) {
+            return invalid(format!(
+                "pool_memory_max = {}: must be greater than the margin",
+                self.pool_memory_max.0
+            ));
+        }
         Ok(())
     }
 }
@@ -396,6 +398,7 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, String> {
 /// Systemd unit name character set and a known suffix (design §9).
 pub fn valid_unit_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.starts_with('-')
         && name.len() <= 255
         && name.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'\\' | b'@' | b'-')
@@ -622,7 +625,23 @@ mod tests {
         assert!(valid_unit_name("app-slicewise-batch.slice"));
         assert!(!valid_unit_name("no-suffix"));
         assert!(!valid_unit_name("bad name.service"));
+        assert!(!valid_unit_name("-Hx.service"));
         assert!(!valid_unit_name(""));
+    }
+
+    #[test]
+    fn pool_cap_must_exceed_the_margin() {
+        let config = Config {
+            pool_memory_max: Size(512 << 20),
+            system_reserve: Size(0),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate(64 << 30)
+                .unwrap_err()
+                .contains("must be greater than the margin")
+        );
     }
 
     #[test]
