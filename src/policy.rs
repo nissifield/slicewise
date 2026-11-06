@@ -370,7 +370,11 @@ fn admission(
     let headroom = headroom(snapshot, config);
     let reserved = state.outstanding(now);
     let available = headroom.saturating_sub(reserved);
-    let margin = margin(config);
+    // design: §5.4 — batch admits with Rule M's 2 * margin, so its own growth never brakes it (R-A).
+    let margin = match request.class {
+        Class::Batch => margin(config).saturating_mul(2),
+        Class::Interactive | Class::Normal => margin(config),
+    };
     let fits = available.saturating_sub(need) >= margin;
     let jobs = jobs(snapshot, config, need, available, request.jobs_hint);
     let comparison = if fits { ">=" } else { "<" };
@@ -726,8 +730,132 @@ mod tests {
         assert_eq!(admission.decision, Decision::Reject);
         assert_eq!(
             admission.reason,
-            "need 8.0G + margin 512.0M > pool cap 8.0G: can never fit"
+            "need 8.0G + margin 1.0G > pool cap 8.0G: can never fit"
         );
+    }
+
+    #[test]
+    fn batch_admission_keeps_two_margins() {
+        let config = config();
+        let state = State::default();
+        let snapshot = make_snapshot(4 * GIB, 8 * GIB, 0);
+
+        let admission = admit(
+            &snapshot,
+            &state,
+            &config,
+            &batch_request(3 * GIB),
+            Duration::ZERO,
+        );
+        assert_eq!(admission.decision, Decision::Admit);
+        assert!(
+            admission.reason.contains("margin 1.0G"),
+            "{}",
+            admission.reason
+        );
+
+        let admission = admit(
+            &snapshot,
+            &state,
+            &config,
+            &batch_request(3 * GIB + 256 * (1 << 20)),
+            Duration::ZERO,
+        );
+        assert_eq!(admission.decision, Decision::Queue { position: 1 });
+
+        let normal = AdmitRequest {
+            unit: "slicewise-normal-1-1.service".into(),
+            class: Class::Normal,
+            ..batch_request(3 * GIB + 256 * (1 << 20))
+        };
+        let admission = admit(&snapshot, &state, &config, &normal, Duration::ZERO);
+        assert_eq!(admission.decision, Decision::Admit);
+    }
+
+    #[test]
+    fn admitted_batch_is_not_braked_by_its_own_hint() {
+        let config = config();
+        let mut state = State::default();
+        let snapshot = make_snapshot(4 * GIB, 8 * GIB, 0);
+        let admission = admit(
+            &snapshot,
+            &state,
+            &config,
+            &batch_request(3 * GIB),
+            Duration::ZERO,
+        );
+        assert_eq!(admission.decision, Decision::Admit);
+        state.apply(&[Action::Admission(admission)], Duration::ZERO);
+
+        let actions = decide(
+            &make_snapshot(7 * GIB, 8 * GIB, 3 * GIB),
+            &mut state,
+            &config,
+            Duration::from_secs(2),
+        );
+        assert!(
+            writes(&actions).all(|write| write.event != WriteEvent::BrakeOn),
+            "a batch job's own growth must not engage the brake"
+        );
+    }
+
+    #[test]
+    fn batch_in_the_old_band_is_rejected() {
+        let config = config();
+        let admission = admit(
+            &make_snapshot(0, 8 * GIB, 0),
+            &State::default(),
+            &config,
+            &batch_request(15 * GIB / 2),
+            Duration::ZERO,
+        );
+        assert_eq!(admission.decision, Decision::Reject);
+        assert_eq!(
+            admission.reason,
+            "need 7.5G + margin 1.0G > pool cap 8.0G: can never fit"
+        );
+    }
+
+    #[test]
+    fn brake_release_needs_more_than_three_margins() {
+        let config = config();
+        let tick = Duration::from_secs(config.tick_secs);
+        let mut state = State::default();
+        state.memory_high[Class::Batch.index()] = Some(GIB);
+
+        let low = make_snapshot(8 * GIB - 5 * GIB / 4, 8 * GIB, 0);
+        for n in 0..20 {
+            let actions = decide(&low, &mut state, &config, n * tick);
+            assert!(
+                writes(&actions).all(|write| write.event != WriteEvent::BrakeOff),
+                "tick {n}"
+            );
+        }
+        assert_eq!(state.high_headroom_ticks, 0);
+
+        let at = make_snapshot(8 * GIB - 3 * GIB / 2, 8 * GIB, 0);
+        for n in 20..30 {
+            let actions = decide(&at, &mut state, &config, n * tick);
+            assert!(
+                writes(&actions).all(|write| write.event != WriteEvent::BrakeOff),
+                "tick {n}"
+            );
+        }
+        assert_eq!(state.high_headroom_ticks, 0);
+
+        let above = make_snapshot(8 * GIB - (3 * GIB / 2 + (1 << 20)), 8 * GIB, 0);
+        for n in 30..34 {
+            let actions = decide(&above, &mut state, &config, n * tick);
+            assert!(
+                writes(&actions).all(|write| write.event != WriteEvent::BrakeOff),
+                "tick {n}"
+            );
+        }
+        let actions = decide(&above, &mut state, &config, 34 * tick);
+        let releases: Vec<_> = writes(&actions)
+            .filter(|write| write.event == WriteEvent::BrakeOff)
+            .collect();
+        assert_eq!(releases.len(), 1, "release on the fifth high tick");
     }
 
     #[test]

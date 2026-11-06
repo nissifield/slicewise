@@ -162,10 +162,10 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 - Clamping is fast and releasing is slow. Together with the separate engage and release thresholds, this prevents oscillation.
 
 **Rule A (admission), run on each `admit` request and for the queue head once per tick.**
-- `need = mem_hint or class.default_mem`.
-- Admit if `H' − need ≥ margin`.
+- `need = mem_hint or class.default_mem`; `admit_margin = 2 × margin` for batch (Rule M's batch threshold) and `margin` for interactive and normal.
+- Admit if `H' − need ≥ admit_margin`. A batch job that grows exactly to its hint then leaves `H ≥ 2 × margin`, so its own growth never engages the brake (M2 ruling R-A).
 - Otherwise, batch work queues (FIFO, at most one batch admission per tick, queue length capped at 32), or fails fast with `--no-queue`.
-- Batch work whose `need + margin` exceeds `pool_memory_max` is rejected, never queued.
+- Batch work whose `need + 2 × margin` exceeds `pool_memory_max` is rejected, never queued.
 - Interactive and normal work is always admitted. If it does not fit, the admission is logged as `over_budget` and Rule M is evaluated at once.
 - An admitted unit holds a reservation of `max(0, need − working_set(unit))`. The reservation is dropped when the unit exits or after 300 s, so two quick admissions cannot both claim the same headroom.
 
@@ -242,8 +242,8 @@ Requests:
 
 Responses:
 ```json
-{"v":1,"ok":true,"decision":"admit","jobs":3,"reason":"headroom 4.4G - reserved 0 >= need 3.0G + margin 0.6G"}
-{"v":1,"ok":true,"decision":"queued","position":1,"reason":"headroom 1.2G < need 3.0G + margin 0.6G"}
+{"v":1,"ok":true,"decision":"admit","jobs":3,"reason":"headroom 4.4G - reserved 0 >= need 3.0G + margin 1.2G"}
+{"v":1,"ok":true,"decision":"queued","position":1,"reason":"headroom 1.2G < need 3.0G + margin 1.2G"}
 {"v":1,"ok":true,"decision":"reject","reason":"queue full (32)"}
 {"v":1,"ok":false,"error":"bad_request","detail":"class: unknown variant 'urgent'"}
 ```
@@ -333,7 +333,7 @@ A semantic error is one line, for example `slicewise: config error: class.batch.
 
 ```
 level=info event=brake_on target=app-slicewise-batch.slice knob=MemoryHigh from=infinity to=6549012480 reason="pool headroom 498M < margin 614M"
-level=info event=admit unit=slicewise-batch-4711-1.service class=batch need=3221225472 jobs=3 reason="headroom 4.4G >= 3.0G + 0.6G"
+level=info event=admit unit=slicewise-batch-4711-1.service class=batch need=3221225472 jobs=3 reason="headroom 4.4G >= 3.0G + 1.2G"
 level=warn event=fallback reason="daemon unreachable" unit=…
 ```
 
@@ -345,8 +345,8 @@ Event names are `admit`, `queue`, `reject`, `over_budget`, `brake_on`, `brake_of
 
 ```
 unit    slicewise-batch-4711-1.service  class=batch  slice=app-slicewise-batch.slice
--4m12s  queued #1: headroom 1.2G - reserved 0 < need 3.0G + margin 0.6G
--2m06s  admitted: headroom 4.4G >= 3.0G + 0.6G; jobs=3 (cpus 5, 3.0G / 1G per job)
+-4m12s  queued #1: headroom 1.2G - reserved 0 < need 3.0G + margin 1.2G
+-2m06s  admitted: headroom 4.4G >= 3.0G + 1.2G; jobs=3 (cpus 5, 3.0G / 1G per job)
 -0m41s  batch MemoryHigh infinity -> 6.1G: headroom 0.5G < margin 0.6G
 now     memory 5.8G  CPUQuota infinity  cpu psi 12%  mem psi 3%
 ```
