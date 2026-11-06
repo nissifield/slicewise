@@ -188,6 +188,88 @@ fn missing_unit_cgroup_omits_it_and_other_errors_keep_the_last_value() {
 }
 
 #[test]
+fn a_failed_slice_clamp_skips_the_fan_out_unit_writes() {
+    let (mut config, tmp, mut sampler, daemon) = scenario();
+    config.adopt.push(Adopt {
+        r#match: "orch-worker-*.scope".into(),
+        class: Class::Batch,
+    });
+    let root = tmp.path().join("cgroup");
+    fs::create_dir_all(root.join("app.slice").join("orch-worker-1.scope")).expect("fake scope");
+    // High pressure from the first refresh, so the clamp engages after two ticks.
+    write(
+        &root
+            .join(POOL_REL)
+            .join(config.class_slice(Class::Interactive))
+            .join("cpu.pressure"),
+        "some avg10=25.00 avg60=0.00 avg300=0.00 total=0\n",
+    );
+
+    let record = Runner::new(Mode::Record);
+    daemon::tick(
+        &daemon,
+        &mut sampler,
+        &config,
+        &record,
+        Duration::from_secs(2),
+    );
+    daemon::tick(
+        &daemon,
+        &mut sampler,
+        &config,
+        &record,
+        Duration::from_secs(4),
+    );
+    assert!(
+        record
+            .recorded()
+            .iter()
+            .any(|argv| argv[1] == "set-property" && argv[3] == "orch-worker-1.scope"),
+        "the unit was adopted: {:?}",
+        record.recorded()
+    );
+
+    // The batch slice clock opens at 10 s, so the clamp write is due at 14 s.
+    let fail = Runner::new(Mode::Fail);
+    daemon::tick(
+        &daemon,
+        &mut sampler,
+        &config,
+        &fail,
+        Duration::from_secs(14),
+    );
+    let attempted: Vec<_> = fail
+        .recorded()
+        .into_iter()
+        .filter(|argv| argv[1] == "set-property")
+        .collect();
+    assert_eq!(
+        attempted.len(),
+        1,
+        "only the slice write, no fan-out: {attempted:?}"
+    );
+    assert_eq!(attempted[0][3], config.class_slice(Class::Batch));
+
+    // Once the slice write lands, the fan-out reaches the tracked unit.
+    let record = Runner::new(Mode::Record);
+    daemon::tick(
+        &daemon,
+        &mut sampler,
+        &config,
+        &record,
+        Duration::from_secs(16),
+    );
+    assert!(
+        record
+            .recorded()
+            .iter()
+            .any(|argv| argv[1] == "set-property" && argv[3] == "orch-worker-1.scope"),
+        "{:?}",
+        record.recorded()
+    );
+}
+
+#[test]
 fn adopt_writes_the_capped_weight_and_reset_matches_it() {
     let (mut config, tmp, mut sampler, daemon) = scenario();
     config.adopt.push(Adopt {

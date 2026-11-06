@@ -320,12 +320,18 @@ pub fn tick(
             }
         }
     }
-    for write in writes {
-        match runner.set_property(&write.slice, &systemd::write_property(&write)) {
+    // design: §5.4 — a slice clamp write that failed leaves the state unchanged, so its
+    // fan-out would repeat every tick; skip the unit quotas until the slice write lands.
+    let mut slice_failed = false;
+    for write in &writes {
+        if slice_failed && write.knob == Knob::CpuQuota && !write.slice.ends_with(".slice") {
+            continue;
+        }
+        match runner.set_property(&write.slice, &systemd::write_property(write)) {
             Ok(_) => {
                 let mut daemon = lock(daemon);
                 daemon.state.apply(&[Action::Write(write.clone())], now);
-                log_write(&write);
+                log_write(write);
                 let unit = (!write.slice.ends_with(".slice")).then_some(write.slice.as_str());
                 daemon.push(
                     now,
@@ -335,11 +341,14 @@ pub fn tick(
                     &write.reason,
                 );
             }
-            Err(error) => log::emit(
-                "warn",
-                "error",
-                &[("target", &write.slice), ("reason", &error)],
-            ),
+            Err(error) => {
+                slice_failed |= write.knob == Knob::CpuQuota && write.slice.ends_with(".slice");
+                log::emit(
+                    "warn",
+                    "error",
+                    &[("target", &write.slice), ("reason", &error)],
+                );
+            }
         }
     }
 }
