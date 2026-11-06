@@ -14,7 +14,7 @@ The project name is defined in one place: the `NAME` constant in `src/main.rs`, 
 
 Static per-unit caps such as `CPUQuota=` and `MemoryMax=` are set for the worst case and are wrong most of the time:
 
-- **Idle capacity is wasted.** A single build on an otherwise idle 6-core / 20 GB box (illustrative example) is still held to its quota. A CPU quota is not work-conserving, while a CPU weight is.
+- **Idle capacity is wasted.** A single build on an otherwise idle 8-core / 32 GB box (illustrative example) is still held to its quota. A CPU quota is not work-conserving, while a CPU weight is.
 - **Memory caps overlap and still OOM.** Per-task caps that add up to more than RAM give no protection. A shared cap fixes the total, but two heavy jobs admitted together are then OOM-killed inside it. Without swap, memory that is already allocated cannot be taken back. The only levers are admission (not starting work that does not fit) and choosing the victim.
 - **Parallelism is fixed at launch.** A build reads `nproc` or `available_parallelism()` once, at start. Later limit changes cannot change `-j`.
 - **No intent.** The kernel cannot tell "a human is waiting on this" from "this can run overnight".
@@ -420,7 +420,7 @@ tests/                common/mod.rs (tempdir helper), fake_cgroup.rs, live_syste
 integrations/hermes/  README.md (runner argv change, task-type→class mapping, adopt pattern example)
 integrations/generic/ README.md (any orchestrator / human)
 docs/                 design.md (this), protocol.md, operations.md (install, migrate, rollback), m0-findings.md
-agents/               role definitions (§13), linked into the coding agent's agent directory
+.claude/agents/       role definitions (§13); AGENTS.md carries the shared rules for any agent CLI
 third_party/vendor/   `cargo vendor` output, committed
 third_party/ponytail/ LICENSE for the adapted agent-instruction style
 ```
