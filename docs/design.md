@@ -153,6 +153,7 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 - If `H < margin/2`, apply the same to normal.
 - When `H > 2 × margin` for 5 consecutive ticks, release one class per 10 s, normal first: `MemoryHigh=infinity`.
 - Interactive is never braked. Its only limit is the static pool cap.
+- The brake target is set once at engage and not retargeted while held; the skip rule therefore applies only to `CPUQuota`.
 
 **Rule C (batch CPU clamp).**
 - When any protected unit's or the interactive slice's `cpu.pressure` some avg10 is ≥ 20 % for 2 ticks, step batch `CPUQuota` down by one CPU's worth per action: `infinity → (C−1)·100 % → … → 100 %`, never below 1 CPU.
@@ -163,6 +164,7 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 - `need = mem_hint or class.default_mem`.
 - Admit if `H' − need ≥ margin`.
 - Otherwise, batch work queues (FIFO, at most one batch admission per tick, queue length capped at 32), or fails fast with `--no-queue`.
+- Batch work whose `need + margin` exceeds `pool_memory_max` is rejected, never queued.
 - Interactive and normal work is always admitted. If it does not fit, the admission is logged as `over_budget` and Rule M is evaluated at once.
 - An admitted unit holds a reservation of `max(0, need − working_set(unit))`. The reservation is dropped when the unit exits or after 300 s, so two quick admissions cannot both claim the same headroom.
 
@@ -269,7 +271,7 @@ The config lives at `$XDG_CONFIG_HOME/slicewise/config.toml` (default `~/.config
 ```toml
 tick_secs       = 2
 pool_slice      = "app-slicewise.slice"   # class slices = <pool stem>-<class>.slice
-pool_memory_max = "12G"                   # static frame; written by `slicewise units`
+# pool_memory_max = "12G"   # default (unset or 0): (MemTotal - system_reserve) * 3/4; static frame written by slicewise units
 system_reserve  = "2G"                    # MemAvailable floor for everything outside the pool
 reserve_cpus    = 1                       # pool CPUQuota = (online - reserve) * 100%
 mem_per_job     = "1G"
@@ -427,15 +429,15 @@ third_party/vendor/   `cargo vendor` output, committed
 third_party/ponytail/ LICENSE for the adapted agent-instruction style
 ```
 
-The target size is ≤ 1 200 LOC in `src/`, with a daemon RSS under 10 MB and under 0.5 % of one core at a 2 s tick.
+The target size is ≤ 1 800 non-blank lines in `src/` outside `#[cfg(test)]` modules at M1, with a daemon RSS under 10 MB and under 0.5 % of one core at a 2 s tick.
 
 | Crate | Version policy | Why (one line) | Weight |
 |---|---|---|---|
-| `serde` (+`derive`) | `1`, locked | typed config and protocol structs without hand-written mapping | proc-macro stack (`serde_derive`, `syn`, `quote`, `proc-macro2`, `unicode-ident`), compile-time only |
-| `serde_json` | `1`, locked | protocol and `--json` output; the socket is a trust boundary, so no hand-rolled JSON parser | + `itoa`, `ryu`, `memchr` |
+| `serde` (+`derive`) | `1`, locked | typed config and protocol structs without hand-written mapping | `serde_core` + proc-macro stack (`serde_derive`, `syn`, `quote`, `proc-macro2`, `unicode-ident`), compile-time only |
+| `serde_json` | `1`, locked | protocol and `--json` output; the socket is a trust boundary, so no hand-rolled JSON parser | + `itoa`, `zmij`, `memchr` |
 | `toml` | current major, `default-features = false`, features `parse`, `serde`, `std` | human-edited config with comments and precise error spans | + `toml_parser`, `toml_datetime`, `serde_spanned`, `winnow` |
 
-That is **3 direct dependencies and about 13 crates in total**, with a hard ceiling of 20. The reviewer checks `cargo tree -e normal --prefix none | sort -u | wc -l`. There are no dev-dependencies.
+That is **3 direct dependencies; 19 lines in `cargo tree -e normal --prefix none | sort -u`** (M1a), with a hard ceiling of 20. `indexmap` and `toml_writer` are in `Cargo.lock` only behind toml's optional `preserve_order` / `display` features, which stay off. The reviewer checks `cargo tree -e normal --prefix none | sort -u | wc -l`. There are no dev-dependencies.
 
 **Rejected:**
 - `tokio`: there is no async need with a few connections and one loop.
