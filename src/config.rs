@@ -273,6 +273,7 @@ impl Config {
     /// Fill an auto (`0`) pool cap, then validate (design §7).
     pub fn resolve(mut self, mem_total: u64) -> Result<Self, String> {
         if self.pool_memory_max.0 == 0 {
+            // design: §7 — unset/0 means (MemTotal - system_reserve) * 3/4.
             self.pool_memory_max = Size(mem_total.saturating_sub(self.system_reserve.0) / 4 * 3);
         }
         self.validate(mem_total)?;
