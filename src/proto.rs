@@ -194,9 +194,17 @@ impl Response {
 pub fn read_one<R: BufRead>(reader: &mut R, mem_total: u64) -> ProtoResult<Request> {
     let mut buffer = Vec::new();
     let mut limited = Read::take(&mut *reader, (MAX_MESSAGE + 1) as u64);
-    limited
-        .read_until(b'\n', &mut buffer)
-        .map_err(|e| (ErrorCode::BadRequest, format!("read: {e}")))?;
+    limited.read_until(b'\n', &mut buffer).map_err(|e| {
+        let code = if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            ErrorCode::Timeout
+        } else {
+            ErrorCode::BadRequest
+        };
+        (code, format!("read: {e}"))
+    })?;
     if buffer.last() == Some(&b'\n') {
         buffer.pop();
     }
@@ -227,6 +235,20 @@ pub fn write_one<W: Write>(writer: &mut W, response: &Response) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    struct WouldBlock;
+    impl Read for WouldBlock {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    #[test]
+    fn read_timeout_maps_to_timeout() {
+        let mut reader = io::BufReader::new(WouldBlock);
+        let (code, _) = read_one(&mut reader, u64::MAX).unwrap_err();
+        assert!(matches!(code, ErrorCode::Timeout));
+    }
 
     use super::*;
 

@@ -249,6 +249,7 @@ impl State {
     }
 
     /// Apply the actions returned by `decide`/`admit` to the state the next tick reads.
+    /// Pass admissions at once; pass writes only after `systemctl` succeeded.
     pub fn apply(&mut self, actions: &[Action], now: Duration) {
         self.expire(now);
         for action in actions {
