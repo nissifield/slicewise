@@ -1,11 +1,12 @@
 # slicewise socket protocol
 
-Design §6.2 is authoritative for framing, strictness and errors. This file records the payloads as implemented at M1.
+Design §6.2 is authoritative for framing, strictness and errors. This file records the payloads as implemented at M1; M2 adds `status.adopted[]`.
 
 ## `status` payload
 
 - `cap`, `working_set`, `headroom`, `margin` (bytes).
 - `classes[]`: `class`, `memory`, `memory_high`, `cpu_quota`, `cpu_psi`, `memory_psi`, `pids`, `brake_secs`, `clamp_secs`. `memory_high` and `cpu_quota` use `null` for infinity; `cpu_quota` and `clamp_secs` are non-null only for batch.
+- `adopted[]`: `unit`, `class`, `cpu_quota` (`null` unless the unit is batch and the batch slice is clamped).
 - `protected[]`: `unit`, `cpu_psi`.
 - `queue`.
 
@@ -14,6 +15,8 @@ Design §6.2 is authoritative for framing, strictness and errors. This file reco
 - `target`, `class`, `slice`.
 - `events[]`: `age_secs`, `event`, `unit`, `reason` (oldest first).
 - `current`: a class row as in `status`.
+
+An adopted unit works as an `explain` target through the `unit` field on its events (`adopt`, `clamp`, `unclamp`).
 
 ## Still to extract from design §6
 

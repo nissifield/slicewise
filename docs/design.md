@@ -124,6 +124,8 @@ The only write outside systemd is the wrapper raising its own `oom_score_adj` fo
 | `cpu.weight` | class slices, pool, protected | static | unit files |
 | `cpu.max` | pool (`(online − reserve_cpus) × 100 %`, only if `reserve_cpus > 0`; off by default because a pool quota throttles every class, interactive included) | static | unit file |
 | `cpu.max` | batch slice | **dynamic** (clamp) | daemon `CPUQuota=` |
+| `cpu.weight` | adopted units (`[[adopt]]`) | at first sight, capped at the pool's 100 | daemon `CPUWeight=` |
+| `cpu.max` | adopted batch units | **dynamic** (rides the batch clamp) | daemon `CPUQuota=` |
 | `memory.max` | pool (`pool_memory_max`) | static, **never changed** | unit file |
 | `memory.high` | pool (`pool_memory_max − margin`) | static | unit file |
 | `memory.high` | batch slice, then normal slice | **dynamic** (brake) | daemon `MemoryHigh=` |
@@ -169,8 +171,10 @@ margin = max(5 % of pool_memory_max, 512 MiB)
 - Interactive and normal work is always admitted. If it does not fit, the admission is logged as `over_budget` and Rule M is evaluated at once.
 - An admitted unit holds a reservation of `max(0, need − working_set(unit))`. The reservation is dropped when the unit exits or after 300 s, so two quick admissions cannot both claim the same headroom.
 
+**Adopted units (M2).** `[[adopt]]` matches unit names that are direct children of the pool's parent slice (`app.slice` by default), where CPU weights compete with the protected unit. A matching unit gets its class's `cpu.weight`, capped at the pool's 100, so an adopted interactive unit cannot outrank the protected unit's 200. When Rule C writes the batch slice's `cpu.max`, it writes the same value to every adopted batch unit as its own logged action; a batch unit first seen while clamped also gets the current clamp. After first sight, writes ride the clamp and unclamp actions. At most 32 adopted units are tracked; any beyond that are ignored and logged once as `event=error`, and units that vanish are forgotten. Adopted units get no memory brake and no `OOMScoreAdjust`. The clamp limit is known: k adopted units get N CPUs each, not N in total; upgrade if the soak shows clamps not helping.
+
 **Bounds on all dynamic writes:**
-- At most one write per slice per 10 s, except engaging the brake.
+- At most one write per slice or adopted unit per 10 s, except engaging the brake and an adopted unit's first-sight writes.
 - A write is skipped when the change would be under max(5 %, 128 MiB) or under one CPU.
 - `MemoryHigh` is never set below the working set.
 - `memory.max` is never touched.
@@ -203,7 +207,7 @@ Live adjustment through a daemon-owned jobserver FIFO is in the backlog (§4).
 
 **Decision (Claude): revert to the static defaults.**
 
-- **Daemon crash, kill or stop.** `slicewise.service` has `ExecStopPost=slicewise reset`. `reset` runs `systemctl --user revert` on the three class slices only, never the pool or protected units. It removes the runtime drop-ins and restores the unit-file values, which means no brake and no clamp (verified in M0). `reset` judges success by exit status alone; anything systemctl prints is informational. systemd runs `ExecStopPost` on failure too, then restarts the daemon (`Restart=on-failure`, `RestartSec=5`), which reconciles from cgroupfs. Workloads keep running throughout, and the hard limits never depended on the daemon.
+- **Daemon crash, kill or stop.** `slicewise.service` has `ExecStopPost=slicewise reset`. `reset` runs `systemctl --user revert` on the three class slices only, never the pool or protected units. It also reverts every present unit that matches an `[[adopt]]` pattern; the M2 adopt spike showed that `revert` restores a transient scope's creation values and leaves the scope running. It removes the runtime drop-ins and restores the unit-file values, which means no brake and no clamp (verified in M0). `reset` judges success by exit status alone; anything systemctl prints is informational. systemd runs `ExecStopPost` on failure too, then restarts the daemon (`Restart=on-failure`, `RestartSec=5`), which reconciles from cgroupfs. Workloads keep running throughout, and the hard limits never depended on the daemon.
 - **No daemon at launch.** The wrapper decides locally with no queue, prints `slicewise: daemon unreachable, launching with static defaults` to stderr, and execs. The orchestrator is never blocked by slicewise being absent.
 - **Daemon dies while a wrapper waits in the queue.** The wrapper sees end-of-file and launches with the warning above.
 - **Bad config.** The daemon exits with code 78 (`RestartPreventExitStatus=78` stops the restart loop). `ExecStopPost` reverts, wrappers fail open, and `slicewise check-config` shows the error. `run` warns `slicewise: config error, launching with static defaults` and continues on `Config::default()`. `reset` uses the parsed config's `pool_slice` without `validate()` (only the unit-name check), falling back to the default name, so it still reverts.
@@ -261,7 +265,7 @@ before: systemd-run --user --slice=tasks.slice -p CPUQuota=… -p MemoryHigh=…
 after:  slicewise run --class normal --mem-hint 4G -- <cmd>
 ```
 
-Background commands the orchestrator starts on its own, outside the wrapper, are covered in M2 by `[[adopt]]` patterns. For running units whose names match a pattern, the daemon applies the class's `CPUWeight` and, for batch, includes them in the CPU clamp. Their memory already counts through `MemAvailable`. Adopted units cannot change slice.
+Background commands the orchestrator starts on its own, outside the wrapper, are covered in M2 by `[[adopt]]` patterns. A pattern matches unit names that are direct children of the pool's parent slice (`app.slice`), where CPU weights compete with the protected unit. For a matching unit the daemon applies the class's `cpu.weight`, capped at the pool's 100; for batch it also applies Rule C's `CPUQuota`, as a separate logged action per unit, and a batch unit first seen while clamped gets the current value. After first sight, writes ride the clamp and unclamp actions. The first match wins. Adopted units keep their own slice, and their memory already counts through `MemAvailable`. The daemon tracks at most 32 adopted units; more are ignored and logged once. Adopted units never get a memory brake or `OOMScoreAdjust`, and `reset` reverts them to their creation values.
 
 Orchestrator-specific glue (runner patch notes, example mappings from task type to class) lives in `integrations/<name>/`, starting with `integrations/hermes/`. Nothing in `src/` knows about any orchestrator.
 
@@ -315,7 +319,8 @@ Validation after parsing checks:
 - sizes no larger than `MemTotal`,
 - `pool_memory_max + system_reserve ≤ MemTotal`,
 - `pool_memory_max` greater than the margin (so > 512 MiB), so the pool's static `MemoryHigh` is always positive,
-- unit names in the systemd character set.
+- unit names in the systemd character set,
+- `[[adopt]]`: `match` has exactly one `*`, the rest is in the unit charset, and it ends in `.scope` or `.service`; at most 16 patterns, the first match wins, and a pattern that matches a `[[protected]]` unit is an error.
 
 A parse error looks like this:
 ```
@@ -339,9 +344,9 @@ level=warn event=fallback reason="daemon unreachable" unit=…
 
 Event names are `admit`, `queue`, `reject`, `over_budget`, `brake_on`, `brake_off`, `clamp`, `unclamp`, `adopt`, `reset`, `fallback` and `error`. Environment values given to `systemd-run` are never logged, because they may hold secrets.
 
-**`slicewise status`** shows the pool (cap, working set, headroom, margin), one row per class (memory, `MemoryHigh`, `CPUQuota`, CPU and memory PSI, task count, queue length), the protected units' PSI, and the brakes and clamps currently in effect with their age. It exits 3 if the daemon is unreachable, and then prints the cgroupfs view only.
+**`slicewise status`** shows the pool (cap, working set, headroom, margin), one row per class (memory, `MemoryHigh`, `CPUQuota`, CPU and memory PSI, task count, queue length), one row per adopted unit (unit, class, current `CPUQuota`), the protected units' PSI, and the brakes and clamps currently in effect with their age. It exits 3 if the daemon is unreachable, and then prints the cgroupfs view only.
 
-**`slicewise explain <unit|class>`** shows the ring-buffer events for that unit and its class, oldest first, then the current numbers:
+**`slicewise explain <unit|class>`** shows the ring-buffer events for that unit and its class, oldest first, then the current numbers. An adopted unit is found through the `unit` field on its events:
 
 ```
 unit    slicewise-batch-4711-1.service  class=batch  slice=app-slicewise-batch.slice
