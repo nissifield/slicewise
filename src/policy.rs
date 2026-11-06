@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub pool: SliceStats,
     pub classes: [SliceStats; 3],
     pub protected_cpu_pressure: Vec<f32>,
+    /// Working set of each reserved unit present in cgroupfs.
+    pub units: BTreeMap<String, u64>,
 }
 
 impl Snapshot {
@@ -67,8 +69,10 @@ pub fn headroom(snapshot: &Snapshot, config: &Config) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub unit: String,
+    pub need: u64,
     pub bytes: u64,
     pub admitted_at: Duration,
+    pub seen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,13 +95,10 @@ pub enum Decision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
-    pub unit: String,
-    pub class: Class,
+    pub request: AdmitRequest,
     pub decision: Decision,
     pub need: u64,
     pub jobs: u32,
-    pub jobs_hint: Option<u32>,
-    pub reservation: u64,
     pub from_queue: bool,
     pub reason: String,
 }
@@ -117,13 +118,6 @@ impl Admission {
 pub enum Knob {
     MemoryHigh,
     CpuQuota,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Limit {
-    Infinity,
-    Bytes(u64),
-    Percent(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +145,8 @@ pub struct Write {
     pub slice: String,
     pub class: Class,
     pub knob: Knob,
-    pub from: Limit,
-    pub to: Limit,
+    pub from: Option<u64>,
+    pub to: Option<u64>,
     pub reason: String,
 }
 
@@ -184,6 +178,7 @@ pub struct State {
     pub psi_high_ticks: u32,
     pub psi_low_ticks: u32,
     pub last_release: Option<Duration>,
+    pub last_observe: Option<Duration>,
 }
 
 impl State {
@@ -192,15 +187,22 @@ impl State {
             .retain(|r| now.saturating_sub(r.admitted_at) < RESERVATION_TTL);
     }
 
-    pub fn outstanding(&self, now: Duration) -> u64 {
+    pub fn outstanding(&self, _now: Duration) -> u64 {
         self.reservations
             .iter()
-            .filter(|r| now.saturating_sub(r.admitted_at) < RESERVATION_TTL)
             .fold(0_u64, |sum, r| sum.saturating_add(r.bytes))
     }
 
-    /// Consecutive-tick counters for Rules M and C. Call once per tick, before `decide`.
-    pub fn observe(&mut self, snapshot: &Snapshot, config: &Config) {
+    /// Consecutive-tick counters for Rules M and C; at most once per `tick_secs`.
+    fn observe(&mut self, snapshot: &Snapshot, config: &Config, now: Duration) {
+        let tick = Duration::from_secs(config.tick_secs);
+        if self
+            .last_observe
+            .is_some_and(|last| now.saturating_sub(last) < tick)
+        {
+            return;
+        }
+        self.last_observe = Some(now);
         let headroom = headroom(snapshot, config);
         if headroom > margin(config).saturating_mul(2) {
             self.high_headroom_ticks = self.high_headroom_ticks.saturating_add(1);
@@ -221,6 +223,21 @@ impl State {
         }
     }
 
+    /// Reservations follow `need - working_set`; drop once the unit has exited.
+    fn update_reservations(&mut self, snapshot: &Snapshot, now: Duration) {
+        self.expire(now);
+        self.reservations
+            .retain_mut(|r| match snapshot.units.get(&r.unit) {
+                Some(&ws) => {
+                    r.seen = true;
+                    r.bytes = r.need.saturating_sub(ws);
+                    true
+                }
+                None if r.seen => false,
+                None => true,
+            });
+    }
+
     pub fn enqueue(&mut self, request: AdmitRequest) -> bool {
         if self.queue.len() >= QUEUE_CAP {
             return false;
@@ -238,33 +255,10 @@ impl State {
                     // design: §5.4 — a brake engage also restarts the per-slice write clock.
                     self.last_write.insert(write.slice.clone(), now);
                     match write.knob {
-                        Knob::MemoryHigh => {
-                            let slot = &mut self.memory_high[write.class.index()];
-                            match write.event {
-                                WriteEvent::BrakeOn => {
-                                    *slot = match write.to {
-                                        Limit::Bytes(bytes) => Some(bytes),
-                                        _ => None,
-                                    }
-                                }
-                                WriteEvent::BrakeOff => *slot = None,
-                                _ => {}
-                            }
+                        Knob::MemoryHigh => self.memory_high[write.class.index()] = write.to,
+                        Knob::CpuQuota => {
+                            self.clamp_cpus = write.to.map(|percent| (percent / 100).max(1) as u32);
                         }
-                        Knob::CpuQuota => match write.event {
-                            WriteEvent::Clamp => {
-                                if let Limit::Percent(percent) = write.to {
-                                    self.clamp_cpus = Some((percent / 100).max(1));
-                                }
-                            }
-                            WriteEvent::Unclamp => {
-                                self.clamp_cpus = match write.to {
-                                    Limit::Percent(percent) => Some((percent / 100).max(1)),
-                                    _ => None,
-                                }
-                            }
-                            _ => {}
-                        },
                     }
                     if write.event == WriteEvent::BrakeOff {
                         self.last_release = Some(now);
@@ -272,12 +266,12 @@ impl State {
                 }
                 Action::Admission(admission) => match admission.decision {
                     Decision::Admit | Decision::OverBudget => {
-                        self.reserve(&admission.unit, admission.reservation, now);
+                        self.reserve(&admission.request.unit, admission.need, now);
                         if admission.from_queue
                             && self
                                 .queue
                                 .front()
-                                .is_some_and(|request| request.unit == admission.unit)
+                                .is_some_and(|request| request.unit == admission.request.unit)
                         {
                             self.queue.pop_front();
                         }
@@ -286,15 +280,9 @@ impl State {
                         if !self
                             .queue
                             .iter()
-                            .any(|request| request.unit == admission.unit)
+                            .any(|request| request.unit == admission.request.unit)
                         {
-                            let _ = self.enqueue(AdmitRequest {
-                                unit: admission.unit.clone(),
-                                class: admission.class,
-                                mem_hint: Some(admission.need),
-                                jobs_hint: admission.jobs_hint,
-                                queue: true,
-                            });
+                            let _ = self.enqueue(admission.request.clone());
                         }
                     }
                     Decision::WouldQueue | Decision::Reject => {}
@@ -303,23 +291,23 @@ impl State {
         }
     }
 
-    fn reserve(&mut self, unit: &str, bytes: u64, now: Duration) {
+    fn reserve(&mut self, unit: &str, need: u64, now: Duration) {
         self.reservations.retain(|r| r.unit != unit);
-        if bytes > 0 {
+        if need > 0 {
             self.reservations.push(Reservation {
                 unit: unit.to_string(),
-                bytes,
+                need,
+                bytes: need,
                 admitted_at: now,
+                seen: false,
             });
         }
     }
 
-    fn can_write(&self, slice: &str, now: Duration, config: &Config, safety: bool) -> bool {
-        safety
-            || self.last_write.get(slice).is_none_or(|last| {
-                now.saturating_sub(*last)
-                    >= Duration::from_secs(config.tuning.min_write_interval_secs)
-            })
+    fn can_write(&self, slice: &str, now: Duration, config: &Config) -> bool {
+        self.last_write.get(slice).is_none_or(|last| {
+            now.saturating_sub(*last) >= Duration::from_secs(config.tuning.min_write_interval_secs)
+        })
     }
 }
 
@@ -391,6 +379,9 @@ fn admission(
         fmt_bytes(margin)
     );
 
+    // design: §5.4 — batch work that can never fit is rejected, never queued.
+    let never_fit =
+        request.class == Class::Batch && need.saturating_add(margin) > config.pool_memory_max.0;
     let decision = match request.class {
         Class::Interactive | Class::Normal => {
             if fits {
@@ -401,7 +392,9 @@ fn admission(
         }
         Class::Batch => {
             // design: §5.4 — a non-empty queue keeps later batch work behind it (FIFO).
-            if fits && (from_queue || state.queue.is_empty()) {
+            if never_fit {
+                Decision::Reject
+            } else if fits && (from_queue || state.queue.is_empty()) {
                 Decision::Admit
             } else if !request.queue {
                 Decision::WouldQueue
@@ -416,6 +409,12 @@ fn admission(
     };
 
     let reason = match decision {
+        Decision::Reject if never_fit => format!(
+            "need {} + margin {} > pool cap {}: can never fit",
+            fmt_bytes(need),
+            fmt_bytes(margin),
+            fmt_bytes(config.pool_memory_max.0)
+        ),
         Decision::Queue { position } => format!("{reason}; queue position {position}"),
         Decision::WouldQueue => format!("{reason}; would queue (--no-queue)"),
         Decision::Reject => "queue full (32)".to_string(),
@@ -423,14 +422,10 @@ fn admission(
     };
 
     Admission {
-        unit: request.unit.clone(),
-        class: request.class,
+        request: request.clone(),
         decision,
         need,
         jobs,
-        jobs_hint: request.jobs_hint,
-        // design: §5.4 — the unit does not exist at admission, so the reservation is `need`.
-        reservation: need,
         from_queue,
         reason,
     }
@@ -445,19 +440,23 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
         if headroom < threshold && state.memory_high[class.index()].is_none() {
             // design: §5.4 — engaged once at ws + 64 MiB and not retargeted while held.
             let target = working_set(snapshot.class(class)).saturating_add(BRAKE_HEADROOM);
-            let bound = if class == Class::Batch {
-                format!("margin {}", fmt_bytes(margin))
+            let (label, bound) = if class == Class::Batch {
+                ("margin", margin)
             } else {
-                format!("margin/2 {}", fmt_bytes(threshold))
+                ("margin/2", threshold)
             };
             actions.push(Action::Write(Write {
                 event: WriteEvent::BrakeOn,
                 slice: config.class_slice(class),
                 class,
                 knob: Knob::MemoryHigh,
-                from: Limit::Infinity,
-                to: Limit::Bytes(target),
-                reason: format!("pool headroom {} < {bound}", fmt_bytes(headroom)),
+                from: None,
+                to: Some(target),
+                reason: format!(
+                    "pool headroom {} < {label} {}",
+                    fmt_bytes(headroom),
+                    fmt_bytes(bound)
+                ),
             }));
         }
     }
@@ -467,33 +466,27 @@ fn memory_brake(snapshot: &Snapshot, state: &State, config: &Config, now: Durati
         let released_recently = state
             .last_release
             .is_some_and(|last| now.saturating_sub(last) < interval);
-        if !released_recently {
-            let class = if state.memory_high[Class::Normal.index()].is_some() {
-                Some(Class::Normal)
-            } else if state.memory_high[Class::Batch.index()].is_some() {
-                Some(Class::Batch)
-            } else {
-                None
-            };
-            if let Some(class) = class {
-                let slice = config.class_slice(class);
-                if state.can_write(&slice, now, config, false) {
-                    actions.push(Action::Write(Write {
-                        event: WriteEvent::BrakeOff,
-                        slice,
-                        class,
-                        knob: Knob::MemoryHigh,
-                        from: state.memory_high[class.index()]
-                            .map_or(Limit::Infinity, Limit::Bytes),
-                        to: Limit::Infinity,
-                        reason: format!(
-                            "pool headroom {} > 2 * margin {} for {} ticks",
-                            fmt_bytes(headroom),
-                            fmt_bytes(margin.saturating_mul(2)),
-                            state.high_headroom_ticks
-                        ),
-                    }));
-                }
+        if !released_recently
+            && let Some(class) = [Class::Normal, Class::Batch]
+                .into_iter()
+                .find(|class| state.memory_high[class.index()].is_some())
+        {
+            let slice = config.class_slice(class);
+            if state.can_write(&slice, now, config) {
+                actions.push(Action::Write(Write {
+                    event: WriteEvent::BrakeOff,
+                    slice,
+                    class,
+                    knob: Knob::MemoryHigh,
+                    from: state.memory_high[class.index()],
+                    to: None,
+                    reason: format!(
+                        "pool headroom {} > 2 * margin {} for {} ticks",
+                        fmt_bytes(headroom),
+                        fmt_bytes(margin.saturating_mul(2)),
+                        state.high_headroom_ticks
+                    ),
+                }));
             }
         }
     }
@@ -509,18 +502,15 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
     let mut actions = Vec::new();
 
     if state.psi_high_ticks >= CLAMP_ENGAGE_TICKS {
-        let next = match state.clamp_cpus {
-            None => cpus.saturating_sub(1).max(1),
-            Some(current) => current.saturating_sub(1).max(1),
-        };
-        if Some(next) != state.clamp_cpus && state.can_write(&slice, now, config, false) {
+        let next = state.clamp_cpus.unwrap_or(cpus).saturating_sub(1).max(1);
+        if Some(next) != state.clamp_cpus && state.can_write(&slice, now, config) {
             actions.push(Action::Write(Write {
                 event: WriteEvent::Clamp,
                 slice,
                 class: batch,
                 knob: Knob::CpuQuota,
-                from: quota(state.clamp_cpus),
-                to: Limit::Percent(next * 100),
+                from: state.clamp_cpus.map(|cpus| u64::from(cpus) * 100),
+                to: Some(u64::from(next) * 100),
                 reason: format!(
                     "cpu pressure {pressure:.1}% >= {}% for {} ticks",
                     config.tuning.cpu_psi_engage, state.psi_high_ticks
@@ -535,14 +525,14 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
         } else {
             Some(current + 1)
         };
-        if state.can_write(&slice, now, config, false) {
+        if state.can_write(&slice, now, config) {
             actions.push(Action::Write(Write {
                 event: WriteEvent::Unclamp,
                 slice,
                 class: batch,
                 knob: Knob::CpuQuota,
-                from: quota(Some(current)),
-                to: next.map_or(Limit::Infinity, |cpus| Limit::Percent(cpus * 100)),
+                from: Some(u64::from(current) * 100),
+                to: next.map(|cpus| u64::from(cpus) * 100),
                 reason: format!(
                     "cpu pressure {pressure:.1}% <= {}% for {} ticks",
                     config.tuning.cpu_psi_release, state.psi_low_ticks
@@ -554,14 +544,23 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
     actions
 }
 
-fn quota(cpus: Option<u32>) -> Limit {
-    cpus.map_or(Limit::Infinity, |cpus| Limit::Percent(cpus * 100))
-}
-
 /// Tick decisions: Rule M, Rule C and the queue head. One batch admission per call.
-pub fn decide(snapshot: &Snapshot, state: &State, config: &Config, now: Duration) -> Vec<Action> {
+pub fn decide(
+    snapshot: &Snapshot,
+    state: &mut State,
+    config: &Config,
+    now: Duration,
+) -> Vec<Action> {
+    state.observe(snapshot, config, now);
+    state.update_reservations(snapshot, now);
     let mut actions = memory_brake(snapshot, state, config, now);
-    actions.extend(cpu_clamp(snapshot, state, config, now));
+    let batch = config.class_slice(Class::Batch);
+    let batch_written = actions.iter().any(|action| {
+        matches!(action, Action::Write(write) if write.slice == batch && write.event != WriteEvent::BrakeOn)
+    });
+    if !batch_written {
+        actions.extend(cpu_clamp(snapshot, state, config, now));
+    }
     if let Some(request) = state.queue.front() {
         let admission = admission(snapshot, state, config, request, now, true);
         if admission.decision == Decision::Admit {
@@ -571,21 +570,15 @@ pub fn decide(snapshot: &Snapshot, state: &State, config: &Config, now: Duration
     actions
 }
 
-/// Rule A for one launch request. Over-budget admissions also evaluate Rule M at once.
+/// Rule A for one launch request. Rule M runs on the loop after an over-budget reply.
 pub fn admit(
     snapshot: &Snapshot,
     state: &State,
     config: &Config,
     request: &AdmitRequest,
     now: Duration,
-) -> Vec<Action> {
-    let admission = admission(snapshot, state, config, request, now, false);
-    let over_budget = admission.decision == Decision::OverBudget;
-    let mut actions = vec![Action::Admission(admission)];
-    if over_budget {
-        actions.extend(memory_brake(snapshot, state, config, now));
-    }
-    actions
+) -> Admission {
+    admission(snapshot, state, config, request, now, false)
 }
 
 #[cfg(test)]
@@ -667,18 +660,15 @@ mod tests {
         let config = config();
         let state = State::default();
         let snapshot = make_snapshot(4 * GIB, 8 * GIB, 0);
-        let actions = admit(
+        let admission = admit(
             &snapshot,
             &state,
             &config,
             &batch_request(2 * GIB),
             Duration::ZERO,
         );
-        let Action::Admission(admission) = &actions[0] else {
-            panic!("first action is an admission");
-        };
         assert_eq!(admission.decision, Decision::Admit);
-        assert_eq!(admission.reservation, 2 * GIB);
+        assert_eq!(admission.need, 2 * GIB);
         assert_eq!(admission.jobs, 4);
         assert!(admission.reason.contains(">="), "{}", admission.reason);
     }
@@ -688,24 +678,18 @@ mod tests {
         let config = config();
         let state = State::default();
         let snapshot = make_snapshot(7 * GIB, 2 * GIB, 0);
-        let actions = admit(
+        let admission = admit(
             &snapshot,
             &state,
             &config,
             &batch_request(4 * GIB),
             Duration::ZERO,
         );
-        let Action::Admission(admission) = &actions[0] else {
-            panic!("first action is an admission");
-        };
         assert_eq!(admission.decision, Decision::Queue { position: 1 });
 
         let mut no_queue = batch_request(4 * GIB);
         no_queue.queue = false;
-        let actions = admit(&snapshot, &state, &config, &no_queue, Duration::ZERO);
-        let Action::Admission(admission) = &actions[0] else {
-            panic!("first action is an admission");
-        };
+        let admission = admit(&snapshot, &state, &config, &no_queue, Duration::ZERO);
         assert_eq!(admission.decision, Decision::WouldQueue);
         assert!(admission.reason.contains("--no-queue"));
 
@@ -716,18 +700,32 @@ mod tests {
                 ..batch_request(4 * GIB)
             }));
         }
-        let actions = admit(
+        let admission = admit(
             &snapshot,
             &full,
             &config,
             &batch_request(4 * GIB),
             Duration::ZERO,
         );
-        let Action::Admission(admission) = &actions[0] else {
-            panic!("first action is an admission");
-        };
         assert_eq!(admission.decision, Decision::Reject);
         assert_eq!(admission.reason, "queue full (32)");
+    }
+
+    #[test]
+    fn batch_that_can_never_fit_is_rejected() {
+        let config = config();
+        let admission = admit(
+            &make_snapshot(0, 8 * GIB, 0),
+            &State::default(),
+            &config,
+            &batch_request(8 * GIB),
+            Duration::ZERO,
+        );
+        assert_eq!(admission.decision, Decision::Reject);
+        assert_eq!(
+            admission.reason,
+            "need 8.0G + margin 512.0M > pool cap 8.0G: can never fit"
+        );
     }
 
     #[test]
@@ -743,16 +741,9 @@ mod tests {
                 jobs_hint: None,
                 queue: true,
             };
-            let actions = admit(&snapshot, &state, &config, &request, Duration::ZERO);
-            let Action::Admission(admission) = &actions[0] else {
-                panic!("first action is an admission");
-            };
+            let admission = admit(&snapshot, &state, &config, &request, Duration::ZERO);
             assert_eq!(admission.decision, Decision::OverBudget);
             assert_eq!(admission.event(), "over_budget");
-            assert!(
-                writes(&actions).any(|write| write.event == WriteEvent::BrakeOn),
-                "over-budget admission evaluates Rule M at once"
-            );
         }
     }
 
@@ -766,17 +757,19 @@ mod tests {
             unit: "slicewise-batch-1-2.service".into(),
             ..batch_request(4 * GIB)
         }));
-        let actions = decide(&snapshot, &state, &config, Duration::ZERO);
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
         assert!(writes(&actions).next().is_none());
         assert_eq!(state.queue.len(), 2);
 
         state.reservations.push(Reservation {
             unit: "old.service".into(),
+            need: GIB,
             bytes: GIB,
             admitted_at: Duration::ZERO,
+            seen: false,
         });
         assert_eq!(state.outstanding(Duration::from_secs(299)), GIB);
-        assert_eq!(state.outstanding(RESERVATION_TTL), 0);
+        assert_eq!(state.outstanding(RESERVATION_TTL), GIB);
         state.expire(RESERVATION_TTL);
         assert!(state.reservations.is_empty());
     }
@@ -799,17 +792,17 @@ mod tests {
         let config = config();
         let mut state = State::default();
         let snapshot = make_snapshot(8 * GIB - 400 * (1 << 20), 8 * GIB, 200 * (1 << 20));
-        let actions = decide(&snapshot, &state, &config, Duration::ZERO);
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
         let brakes: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOn)
             .collect();
         assert_eq!(brakes.len(), 1);
         assert_eq!(brakes[0].class, Class::Batch);
-        assert_eq!(brakes[0].to, Limit::Bytes(200 * (1 << 20) + BRAKE_HEADROOM));
+        assert_eq!(brakes[0].to, Some(200 * (1 << 20) + BRAKE_HEADROOM));
         state.apply(&actions, Duration::ZERO);
 
         let snapshot = make_snapshot(8 * GIB - 200 * (1 << 20), 8 * GIB, 0);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(2));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(2));
         let brakes: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOn)
             .collect();
@@ -821,14 +814,12 @@ mod tests {
     #[test]
     fn brake_target_is_never_below_the_working_set() {
         let config = config();
-        let state = State::default();
+        let mut state = State::default();
         let used = 1234 * (1 << 20);
         let snapshot = make_snapshot(8 * GIB - 100 * (1 << 20), 8 * GIB, used);
-        let actions = decide(&snapshot, &state, &config, Duration::ZERO);
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
         let write = writes(&actions).next().unwrap();
-        let Limit::Bytes(target) = write.to else {
-            panic!("brake target is bytes");
-        };
+        let target = write.to.expect("brake target is bytes");
         assert!(target >= working_set(snapshot.class(Class::Batch)));
     }
 
@@ -840,17 +831,15 @@ mod tests {
         state.memory_high[Class::Batch.index()] = Some(GIB);
         let snapshot = make_snapshot(0, 8 * GIB, 0);
         for tick in 0..BRAKE_RELEASE_TICKS - 1 {
-            state.observe(&snapshot, &config);
             let actions = decide(
                 &snapshot,
-                &state,
+                &mut state,
                 &config,
                 Duration::from_secs(u64::from(tick) * 2),
             );
             assert!(writes(&actions).next().is_none(), "tick {tick}");
         }
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(8));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(8));
         let releases: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOff)
             .collect();
@@ -858,13 +847,12 @@ mod tests {
         assert_eq!(releases[0].class, Class::Normal);
         state.apply(&actions, Duration::from_secs(8));
 
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(12));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(12));
         assert!(
             writes(&actions).all(|write| write.event != WriteEvent::BrakeOff),
             "second release waits one interval"
         );
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(18));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(18));
         let releases: Vec<_> = writes(&actions)
             .filter(|write| write.event == WriteEvent::BrakeOff)
             .collect();
@@ -878,11 +866,10 @@ mod tests {
         let snapshot = make_snapshot(8 * GIB, 8 * GIB, 0);
         let mut state = State::default();
         let slice = config.class_slice(Class::Batch);
-        assert!(state.can_write(&slice, Duration::ZERO, &config, false));
+        assert!(state.can_write(&slice, Duration::ZERO, &config));
         state.last_write.insert(slice.clone(), Duration::ZERO);
-        assert!(!state.can_write(&slice, Duration::from_secs(9), &config, false));
-        assert!(state.can_write(&slice, Duration::from_secs(10), &config, false));
-        assert!(state.can_write(&slice, Duration::from_secs(9), &config, true));
+        assert!(!state.can_write(&slice, Duration::from_secs(9), &config));
+        assert!(state.can_write(&slice, Duration::from_secs(10), &config));
         assert_eq!(working_set(&snapshot.pool), 8 * GIB);
     }
 
@@ -893,23 +880,19 @@ mod tests {
         let mut snapshot = make_snapshot(0, 8 * GIB, 0);
         snapshot.online_cpus = 4;
         snapshot.classes[Class::Interactive.index()] = stats(0, 0, 25.0);
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::ZERO);
+        let actions = decide(&snapshot, &mut state, &config, Duration::ZERO);
         assert!(writes(&actions).next().is_none(), "one tick is not enough");
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(2));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(2));
         let clamp = writes(&actions).next().unwrap();
         assert_eq!(clamp.event, WriteEvent::Clamp);
-        assert_eq!(clamp.from, Limit::Infinity);
-        assert_eq!(clamp.to, Limit::Percent(200));
+        assert_eq!(clamp.from, None);
+        assert_eq!(clamp.to, Some(200));
         state.apply(&actions, Duration::from_secs(2));
 
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(12));
-        assert_eq!(writes(&actions).next().unwrap().to, Limit::Percent(100));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(12));
+        assert_eq!(writes(&actions).next().unwrap().to, Some(100));
         state.apply(&actions, Duration::from_secs(12));
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(22));
+        let actions = decide(&snapshot, &mut state, &config, Duration::from_secs(22));
         assert!(writes(&actions).next().is_none(), "100% is the floor");
         assert_eq!(state.clamp_cpus, Some(1));
     }
@@ -924,26 +907,28 @@ mod tests {
         let mut snapshot = make_snapshot(0, 8 * GIB, 0);
         snapshot.online_cpus = 5;
         snapshot.classes[Class::Interactive.index()] = stats(0, 0, 1.0);
+        let step = Duration::from_secs(config.tick_secs);
+        let mut now = Duration::ZERO;
         for _ in 0..CLAMP_RELEASE_TICKS - 1 {
-            state.observe(&snapshot, &config);
-            let actions = decide(&snapshot, &state, &config, Duration::ZERO);
+            now += step;
+            let actions = decide(&snapshot, &mut state, &config, now);
             assert!(writes(&actions).all(|write| write.event != WriteEvent::Unclamp));
         }
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(10));
+        now += step;
+        let actions = decide(&snapshot, &mut state, &config, now);
         let unclamp = writes(&actions).next().unwrap();
         assert_eq!(unclamp.event, WriteEvent::Unclamp);
-        assert_eq!(unclamp.from, Limit::Percent(100));
-        assert_eq!(unclamp.to, Limit::Percent(200));
-        state.apply(&actions, Duration::from_secs(10));
+        assert_eq!(unclamp.from, Some(100));
+        assert_eq!(unclamp.to, Some(200));
+        state.apply(&actions, now);
 
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(20));
-        assert_eq!(writes(&actions).next().unwrap().to, Limit::Percent(300));
-        state.apply(&actions, Duration::from_secs(20));
-        state.observe(&snapshot, &config);
-        let actions = decide(&snapshot, &state, &config, Duration::from_secs(30));
-        assert_eq!(writes(&actions).next().unwrap().to, Limit::Infinity);
+        now += Duration::from_secs(10);
+        let actions = decide(&snapshot, &mut state, &config, now);
+        assert_eq!(writes(&actions).next().unwrap().to, Some(300));
+        state.apply(&actions, now);
+        now += Duration::from_secs(10);
+        let actions = decide(&snapshot, &mut state, &config, now);
+        assert_eq!(writes(&actions).next().unwrap().to, None);
     }
 
     #[test]
@@ -952,7 +937,7 @@ mod tests {
         let mut state = State::default();
         assert!(state.enqueue(batch_request(2 * GIB)));
         let low = make_snapshot(8 * GIB, 8 * GIB, 0);
-        let actions = decide(&low, &state, &config, Duration::ZERO);
+        let actions = decide(&low, &mut state, &config, Duration::ZERO);
         assert!(
             actions
                 .iter()
@@ -960,12 +945,64 @@ mod tests {
             "no fit, no admission"
         );
         let high = make_snapshot(0, 8 * GIB, 0);
-        let actions = decide(&high, &state, &config, Duration::from_secs(2));
+        let actions = decide(&high, &mut state, &config, Duration::from_secs(2));
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].event(), "admit");
         state.apply(&actions, Duration::from_secs(2));
         assert!(state.queue.is_empty());
         assert_eq!(state.outstanding(Duration::from_secs(2)), 2 * GIB);
+    }
+
+    #[test]
+    fn one_write_per_tick_to_the_batch_slice() {
+        let config = config();
+        let now = Duration::from_secs(10);
+        let mut state = State {
+            memory_high: [None, None, Some(GIB)],
+            clamp_cpus: Some(1),
+            high_headroom_ticks: BRAKE_RELEASE_TICKS,
+            psi_low_ticks: CLAMP_RELEASE_TICKS,
+            last_observe: Some(now),
+            ..State::default()
+        };
+        state
+            .last_write
+            .insert(config.class_slice(Class::Batch), Duration::ZERO);
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot.classes[Class::Interactive.index()] = stats(0, 0, 1.0);
+
+        let actions = decide(&snapshot, &mut state, &config, now);
+        let writes: Vec<_> = writes(&actions).collect();
+        assert_eq!(writes.len(), 1, "only the brake release may be written");
+        assert_eq!(writes[0].event, WriteEvent::BrakeOff);
+        assert_eq!(writes[0].slice, config.class_slice(Class::Batch));
+    }
+
+    #[test]
+    fn reservation_shrinks_as_unit_grows_and_drops_on_exit() {
+        let config = config();
+        let tick = Duration::from_secs(config.tick_secs);
+        let mut state = State::default();
+        let request = batch_request(2 * GIB);
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        let admission = admit(&snapshot, &state, &config, &request, Duration::ZERO);
+        assert_eq!(admission.decision, Decision::Admit);
+        state.apply(&[Action::Admission(admission)], Duration::ZERO);
+        assert_eq!(state.reservations[0].bytes, 2 * GIB);
+        assert!(!state.reservations[0].seen);
+
+        snapshot.units.insert(request.unit.clone(), GIB / 2);
+        let _ = decide(&snapshot, &mut state, &config, tick);
+        assert!(state.reservations[0].seen);
+        assert_eq!(state.reservations[0].bytes, 2 * GIB - GIB / 2);
+
+        snapshot.units.insert(request.unit.clone(), 3 * GIB / 2);
+        let _ = decide(&snapshot, &mut state, &config, 2 * tick);
+        assert_eq!(state.reservations[0].bytes, GIB / 2);
+
+        snapshot.units.clear();
+        let _ = decide(&snapshot, &mut state, &config, 3 * tick);
+        assert!(state.reservations.is_empty());
     }
 
     #[test]
@@ -988,16 +1025,19 @@ mod tests {
             }
             let mut now = Duration::ZERO;
             let mut seen: BTreeMap<String, Duration> = BTreeMap::new();
+            let mut brake_engaged: Option<Duration> = None;
+            let mut clamp_engaged: Option<Duration> = None;
             let mut high = next(&mut lcg) % 2 == 0;
             let mut run = 0_u32;
-            let mut run_ticks = 2 + (next(&mut lcg) % 3) as u32;
+            let mut run_ticks = 1 + (next(&mut lcg) % 20) as u32;
+            let admit_tick = next(&mut lcg) % 60;
 
-            for _ in 0..12 {
+            for tick_index in 0..60_u64 {
                 now += tick;
                 if run >= run_ticks {
                     high = !high;
                     run = 0;
-                    run_ticks = 2 + (next(&mut lcg) % 3) as u32;
+                    run_ticks = 1 + (next(&mut lcg) % 20) as u32;
                 }
                 run += 1;
 
@@ -1017,8 +1057,7 @@ mod tests {
                     stats(0, 0, if high { 25.0 } else { 1.0 });
                 snapshot.classes[Class::Normal.index()] = stats(next(&mut lcg) % GIB, 0, 0.0);
 
-                state.observe(&snapshot, &config);
-                let actions = decide(&snapshot, &state, &config, now);
+                let actions = decide(&snapshot, &mut state, &config, now);
 
                 for write in writes(&actions) {
                     if write.knob == Knob::MemoryHigh {
@@ -1027,7 +1066,7 @@ mod tests {
                             Class::Interactive,
                             "interactive is never braked"
                         );
-                        if let Limit::Bytes(bytes) = write.to {
+                        if let Some(bytes) = write.to {
                             assert!(
                                 bytes >= working_set(snapshot.class(write.class)),
                                 "MemoryHigh {bytes} below working set"
@@ -1035,7 +1074,7 @@ mod tests {
                         }
                     }
                     if write.knob == Knob::CpuQuota
-                        && let Limit::Percent(percent) = write.to
+                        && let Some(percent) = write.to
                     {
                         assert!(percent >= 100, "clamp below one CPU");
                     }
@@ -1049,13 +1088,43 @@ mod tests {
                         }
                         seen.insert(write.slice.clone(), now);
                     }
-                    assert!(
-                        !matches!(write.event, WriteEvent::BrakeOff | WriteEvent::Unclamp),
-                        "release inside an oscillating sequence (30 s hysteresis violated): {}",
-                        write.slice
-                    );
+                    match write.event {
+                        WriteEvent::BrakeOn => brake_engaged = Some(now),
+                        WriteEvent::Clamp => clamp_engaged = Some(now),
+                        // A short run that still releases means a counter leaked across runs.
+                        WriteEvent::BrakeOff if run < BRAKE_RELEASE_TICKS => {
+                            if let Some(engaged) = brake_engaged {
+                                assert!(
+                                    now.saturating_sub(engaged) >= Duration::from_secs(30),
+                                    "brake released {} after engage on a short run",
+                                    write.slice
+                                );
+                            }
+                        }
+                        WriteEvent::Unclamp if run < CLAMP_RELEASE_TICKS => {
+                            if let Some(engaged) = clamp_engaged {
+                                assert!(
+                                    now.saturating_sub(engaged) >= Duration::from_secs(30),
+                                    "clamp released {} after engage on a short run",
+                                    write.slice
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 state.apply(&actions, now);
+
+                if tick_index == admit_tick {
+                    let admission = admit(
+                        &snapshot,
+                        &state,
+                        &config,
+                        &batch_request(1 + next(&mut lcg) % (4 * GIB)),
+                        now,
+                    );
+                    state.apply(&[Action::Admission(admission)], now);
+                }
             }
         }
     }
