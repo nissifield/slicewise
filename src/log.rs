@@ -1,9 +1,7 @@
 //! Logfmt line helper (design §8). Callers must never pass environment values.
 
-/// `level=... event=... key=value...` with the remaining keys sorted.
+/// `level=... event=... key=value...` with the keys in caller order.
 pub fn line(level: &str, event: &str, fields: &[(&str, &str)]) -> String {
-    let mut fields = fields.to_vec();
-    fields.sort_unstable_by_key(|(key, _)| *key);
     let mut out = format!("level={} event={}", quote(level), quote(event));
     for (key, value) in fields {
         out.push(' ');
@@ -42,7 +40,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn puts_level_event_then_sorted_keys() {
+    fn puts_level_event_then_keys_in_caller_order() {
         let line = line(
             "info",
             "brake_on",
@@ -53,7 +51,7 @@ mod tests {
         );
         assert_eq!(
             line,
-            "level=info event=brake_on target=app-slicewise-batch.slice to=6549012480"
+            "level=info event=brake_on to=6549012480 target=app-slicewise-batch.slice"
         );
     }
 
