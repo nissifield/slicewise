@@ -266,9 +266,10 @@ impl State {
                     self.last_write.insert(write.slice.clone(), now);
                     match write.knob {
                         Knob::MemoryHigh => self.memory_high[write.class.index()] = write.to,
-                        Knob::CpuQuota => {
+                        Knob::CpuQuota if write.slice.ends_with(".slice") => {
                             self.clamp_cpus = write.to.map(|percent| (percent / 100).max(1) as u32);
                         }
+                        Knob::CpuQuota => {}
                         Knob::CpuWeight => {}
                     }
                     match write.event {

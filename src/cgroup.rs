@@ -138,7 +138,6 @@ pub fn slice_stats(root: &Path, rel: &str) -> io::Result<SliceStats> {
     })
 }
 
-/// `*.scope` and `*.service` entries directly under `rel`; the adopt candidates (design §6.3).
 pub fn list_units(root: &Path, rel: &str) -> io::Result<Vec<String>> {
     let mut units: Vec<String> = fs::read_dir(path(root, rel))?
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
