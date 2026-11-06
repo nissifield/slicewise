@@ -11,7 +11,7 @@ use crate::config::{Class, valid_unit_name};
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const JOBS_HINT_MAX: u32 = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Request {
     Admit {
