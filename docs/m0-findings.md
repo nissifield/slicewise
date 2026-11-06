@@ -70,3 +70,52 @@ injectable roots, with parser unit tests).
    non-empty stdout as informational, and should only ever name the class slices (never the pool).
 
 **Architect rulings (review of the spike):** change 1 PARTIAL (option a, raise-only, fail-open, in `cli.rs`; M1 live test must assert scope inheritance and check `memory.oom.group` for scopes); change 2 ACCEPT; change 3 PARTIAL (no stdout premise). Applied to `docs/design.md` §5.2, §5.3, §5.7, §6.1.
+
+## M2 adopt spike
+
+Question: does `systemctl --user revert` on a **transient** scope restore the values it was created with and leave
+the scope running? The M2 `[[adopt]]` reset path needs both.
+
+Probe: two throwaway scopes named `sw-adopt-probe-<n>.scope`, created and stopped only for this spike. No other
+unit was read or written. Values come from the scope's `ControlGroup` in cgroupfs (`cpu.weight`, `cpu.max`), run as
+the unprivileged user against `user@$UID.service` (default `app.slice`). Both scopes stayed active throughout and
+were stopped afterwards.
+
+**(a) set-property reaches a transient scope — PASS**
+
+```
+systemd-run --user --scope --unit=sw-adopt-probe-1 sleep 120 &
+systemctl --user set-property --runtime sw-adopt-probe-1.scope CPUWeight=25 CPUQuota=300%
+```
+
+Before: `cpu.weight=100`, `cpu.max=max 100000`. `set-property` exit 0; after: `cpu.weight=25`,
+`cpu.max=300000 100000`; scope active.
+
+**(b) revert restores the creation values — PASS**
+
+```
+systemctl --user revert sw-adopt-probe-1.scope
+```
+
+`revert` exit 0; scope still active; `cpu.weight=100`, `cpu.max=max 100000`. `revert` removed the runtime
+drop-ins `50-CPUWeight.conf` and `50-CPUQuota.conf` under `<runtime-dir>/systemd/transient/<scope>.d`.
+
+**(c) revert restores a creation-time quota — PASS**
+
+```
+systemd-run --user --scope --unit=sw-adopt-probe-2 -p CPUQuota=150% sleep 120 &
+systemctl --user set-property --runtime sw-adopt-probe-2.scope CPUWeight=25 CPUQuota=300%
+systemctl --user revert sw-adopt-probe-2.scope
+```
+
+Created with `cpu.weight=100`, `cpu.max=150000 100000`; after `set-property`, `25` / `300000 100000`; after
+`revert`, exit 0, scope active, `cpu.weight=100`, `cpu.max=150000 100000`.
+
+**Ruling: the main ruling applies.** (b) and (c) both pass, so `reset` may `systemctl --user revert` adopted
+units, P4 keeps first-sight adoption, and the section 2 fallback (write `CPUQuota=`, refuse pre-throttled units,
+document the pattern caveat) is not needed.
+
+Cleanup: both probe scopes stopped;
+`systemctl --user list-units 'sw-adopt-probe*' --all --no-legend | wc -l` → `0` and
+`ls "$XDG_RUNTIME_DIR/systemd/user.control" | grep -c sw-adopt` → `0` (no runtime drop-ins left).
+
