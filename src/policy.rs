@@ -557,7 +557,7 @@ fn cpu_clamp(snapshot: &Snapshot, state: &State, config: &Config, now: Duration)
     actions
 }
 
-fn adopt(snapshot: &Snapshot, state: &State, config: &Config) -> Vec<Action> {
+fn adopt(snapshot: &Snapshot, state: &State, config: &Config, quota: Option<u64>) -> Vec<Action> {
     let mut actions = Vec::new();
     let capacity = 32usize.saturating_sub(state.adopted.len());
     for (unit, &class) in snapshot
@@ -568,9 +568,10 @@ fn adopt(snapshot: &Snapshot, state: &State, config: &Config) -> Vec<Action> {
     {
         let weight = Some(u64::from(config.classes.cpu_weight(class).min(100)));
         actions.push(aw(unit, class, CpuWeight, weight, Adopt));
-        if let Some(cpus) = state.clamp_cpus.filter(|_| class == Class::Batch) {
-            let quota = Some(u64::from(cpus) * 100);
-            actions.push(aw(unit, class, CpuQuota, quota, Clamp));
+        if class == Class::Batch
+            && let Some(quota) = quota
+        {
+            actions.push(aw(unit, class, CpuQuota, Some(quota), Clamp));
         }
     }
     actions
@@ -615,7 +616,14 @@ pub fn decide(
     if !batch_written {
         actions.extend(cpu_clamp(snapshot, state, config, now));
     }
-    actions.extend(adopt(snapshot, state, config));
+    // The batch slice's quota after this tick's step (`None` = unlimited); a unit first seen in
+    // this tick must take it, not the value the previous tick left in `state`.
+    let clamp = actions.iter().find_map(|action| match action {
+        Action::Write(w) if w.slice == batch && w.knob == CpuQuota => Some(w.to),
+        _ => None,
+    });
+    let clamp = clamp.unwrap_or_else(|| state.clamp_cpus.map(|cpus| u64::from(cpus) * 100));
+    actions.extend(adopt(snapshot, state, config, clamp));
     if let Some(request) = state.queue.front() {
         let admission = admission(snapshot, state, config, request, now, true);
         if admission.decision == Decision::Admit {
@@ -1210,6 +1218,7 @@ mod tests {
             }
             let mut now = Duration::ZERO;
             let mut seen: BTreeMap<String, Duration> = BTreeMap::new();
+            let mut quota: BTreeMap<String, Option<u64>> = BTreeMap::new();
             let mut brake_engaged: Option<Duration> = None;
             let mut clamp_engaged: Option<Duration> = None;
             let mut high = next(&mut lcg) % 2 == 0;
@@ -1241,6 +1250,13 @@ mod tests {
                         .insert(format!("orch-worker-{n}.scope"), Class::Batch);
                 }
                 snapshot.online_cpus = 2 + (next(&mut lcg) % 7) as u32;
+                // A unit that appears while clamped must take this tick's clamp (L11: N1's case).
+                if tick_index >= 5 && tick_index % 7 == 0 {
+                    snapshot.adopted.insert(
+                        format!("orch-late-{sequence}-{tick_index}.scope"),
+                        Class::Batch,
+                    );
+                }
                 snapshot.classes[Class::Interactive.index()] =
                     stats(0, 0, if high { 25.0 } else { 1.0 });
                 snapshot.classes[Class::Normal.index()] = stats(next(&mut lcg) % GIB, 0, 0.0);
@@ -1272,6 +1288,9 @@ mod tests {
                     {
                         assert_eq!(write.class, Class::Batch, "only batch is clamped");
                         assert!(percent >= 100, "clamp below one CPU");
+                    }
+                    if write.knob == Knob::CpuQuota && !write.slice.ends_with(".slice") {
+                        quota.insert(write.slice.clone(), write.to);
                     }
                     if write.event == WriteEvent::Adopt {
                         assert!(
@@ -1323,6 +1342,15 @@ mod tests {
                     }
                 }
                 state.apply(&actions, now);
+                let batch_quota = state.clamp_cpus.map(|cpus| u64::from(cpus) * 100);
+                for unit in state.adopted.keys() {
+                    assert_eq!(
+                        quota.get(unit).copied().flatten(),
+                        batch_quota,
+                        "{} lags the batch slice's quota after tick {tick_index}",
+                        unit
+                    );
+                }
 
                 if tick_index == admit_tick {
                     // A distinct unit, so this admission cannot alias the queued one (L11).
@@ -1409,6 +1437,36 @@ mod tests {
                 .any(|write| write.slice == "orch-worker-1.scope" && write.to == Some(200))
         );
         assert!(!quota.iter().any(|write| write.slice == "chat.scope"));
+    }
+
+    #[test]
+    fn adopt_in_the_unclamp_tick_writes_no_quota() {
+        let config = config();
+        let now = Duration::from_secs(2);
+        // cpus = 4; clamped at 3 and low pressure has held for the release ticks.
+        let mut state = State {
+            clamp_cpus: Some(3),
+            psi_low_ticks: CLAMP_RELEASE_TICKS,
+            last_observe: Some(now),
+            ..State::default()
+        };
+        let mut snapshot = make_snapshot(0, 8 * GIB, 0);
+        snapshot
+            .adopted
+            .insert("orch-worker-1.scope".into(), Class::Batch);
+
+        let actions = decide(&snapshot, &mut state, &config, now);
+        assert!(
+            writes(&actions).any(|write| write.slice == config.class_slice(Class::Batch)
+                && write.knob == Knob::CpuQuota
+                && write.to.is_none()),
+            "this tick unclamps the batch slice to unlimited"
+        );
+        let unit: Vec<_> = writes(&actions)
+            .filter(|write| write.slice == "orch-worker-1.scope")
+            .collect();
+        assert_eq!(unit.len(), 1, "only the weight, no stale clamp");
+        assert_eq!(unit[0].event, WriteEvent::Adopt);
     }
 
     #[test]
