@@ -1,8 +1,7 @@
 //! Socket protocol types and framing (design §6.2): one JSON object per line,
 //! 64 KiB limit, closed enums, `deny_unknown_fields`, `v` must be 1.
 
-use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,44 +37,71 @@ fn default_queue() -> bool {
     true
 }
 
+type ProtoResult<T> = Result<T, (ErrorCode, String)>;
+
 impl Request {
-    fn validate(&self) -> Result<(), ProtoError> {
+    fn validate(&self, mem_total: u64) -> ProtoResult<()> {
         match self {
             Request::Admit {
-                v, unit, jobs_hint, ..
+                v,
+                unit,
+                mem_hint,
+                jobs_hint,
+                ..
             } => {
                 check_version(*v)?;
                 if !valid_unit_name(unit) {
-                    return Err(ProtoError::BadRequest(format!(
-                        "unit = {unit:?}: invalid systemd unit name"
-                    )));
+                    return Err((
+                        ErrorCode::BadRequest,
+                        format!("unit = {unit:?}: invalid systemd unit name"),
+                    ));
+                }
+                if let Some(hint) = mem_hint
+                    && *hint > mem_total
+                {
+                    return Err((
+                        ErrorCode::BadRequest,
+                        format!("mem_hint = {hint}: must be <= MemTotal {mem_total}"),
+                    ));
                 }
                 if let Some(jobs) = jobs_hint
                     && *jobs > JOBS_HINT_MAX
                 {
-                    return Err(ProtoError::BadRequest(format!(
-                        "jobs_hint = {jobs}: must be <= {JOBS_HINT_MAX}"
-                    )));
+                    return Err((
+                        ErrorCode::BadRequest,
+                        format!("jobs_hint = {jobs}: must be <= {JOBS_HINT_MAX}"),
+                    ));
                 }
             }
-            Request::Status { v } | Request::Explain { v, .. } => check_version(*v)?,
+            Request::Status { v } => check_version(*v)?,
+            Request::Explain { v, target } => {
+                check_version(*v)?;
+                if !valid_unit_name(target)
+                    && !matches!(target.as_str(), "interactive" | "normal" | "batch")
+                {
+                    return Err((
+                        ErrorCode::BadRequest,
+                        format!("target = {target:?}: invalid unit name or class"),
+                    ));
+                }
+            }
         }
         Ok(())
     }
 }
 
-fn check_version(v: u32) -> Result<(), ProtoError> {
+fn check_version(v: u32) -> ProtoResult<()> {
     if v == 1 {
         Ok(())
     } else {
-        Err(ProtoError::UnsupportedVersion(v))
+        Err((ErrorCode::UnsupportedVersion, format!("v = {v}")))
     }
 }
 
-fn parse_request(bytes: &[u8]) -> Result<Request, ProtoError> {
+fn parse_request(bytes: &[u8], mem_total: u64) -> ProtoResult<Request> {
     let request: Request =
-        serde_json::from_slice(bytes).map_err(|e| ProtoError::BadRequest(e.to_string()))?;
-    request.validate()?;
+        serde_json::from_slice(bytes).map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
+    request.validate(mem_total)?;
     Ok(request)
 }
 
@@ -98,7 +124,6 @@ pub enum ErrorCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Response {
     pub v: u32,
     pub ok: bool,
@@ -165,81 +190,38 @@ impl Response {
     }
 }
 
-#[derive(Debug)]
-pub enum ProtoError {
-    Io(io::Error),
-    BadRequest(String),
-    UnsupportedVersion(u32),
-    TooLarge,
-}
-
-impl fmt::Display for ProtoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProtoError::Io(error) => write!(f, "i/o error: {error}"),
-            ProtoError::BadRequest(detail) => write!(f, "bad_request: {detail}"),
-            ProtoError::UnsupportedVersion(version) => {
-                write!(f, "unsupported_version: v = {version}")
-            }
-            ProtoError::TooLarge => write!(f, "too_large: limit is {MAX_MESSAGE} bytes"),
-        }
-    }
-}
-
-impl std::error::Error for ProtoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ProtoError::Io(error) => Some(error),
-            ProtoError::BadRequest(_)
-            | ProtoError::UnsupportedVersion(_)
-            | ProtoError::TooLarge => None,
-        }
-    }
-}
-
-impl From<io::Error> for ProtoError {
-    fn from(error: io::Error) -> Self {
-        ProtoError::Io(error)
-    }
-}
-
 /// Read one newline-terminated request; EOF terminates a partial final line.
-pub fn read_one<R: Read>(reader: &mut R) -> Result<Request, ProtoError> {
+pub fn read_one<R: BufRead>(reader: &mut R, mem_total: u64) -> ProtoResult<Request> {
     let mut buffer = Vec::new();
-    let mut byte = [0_u8; 1];
-    // shortcut: one byte per read; requests are capped at 64 KiB and rare (§6.2).
-    loop {
-        match reader.read(&mut byte)? {
-            0 => break,
-            _ if byte[0] == b'\n' => break,
-            _ => {
-                if buffer.len() >= MAX_MESSAGE {
-                    return Err(ProtoError::TooLarge);
-                }
-                buffer.push(byte[0]);
-            }
-        }
+    let mut limited = Read::take(&mut *reader, (MAX_MESSAGE + 1) as u64);
+    limited
+        .read_until(b'\n', &mut buffer)
+        .map_err(|e| (ErrorCode::BadRequest, format!("read: {e}")))?;
+    if buffer.last() == Some(&b'\n') {
+        buffer.pop();
+    }
+    if buffer.len() > MAX_MESSAGE {
+        return Err((ErrorCode::TooLarge, format!("limit is {MAX_MESSAGE} bytes")));
     }
     if buffer.is_empty() {
-        return Err(ProtoError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "connection closed",
-        )));
+        return Err((ErrorCode::BadRequest, "connection closed".to_string()));
     }
-    parse_request(&buffer)
+    parse_request(&buffer, mem_total)
 }
 
 /// Write one response followed by a newline, enforcing the same size limit.
-pub fn write_one<W: Write>(writer: &mut W, response: &Response) -> Result<(), ProtoError> {
-    let mut bytes = serde_json::to_vec(response)
-        .map_err(|e| ProtoError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+pub fn write_one<W: Write>(writer: &mut W, response: &Response) -> io::Result<()> {
+    let mut bytes =
+        serde_json::to_vec(response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_MESSAGE {
-        return Err(ProtoError::TooLarge);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response too large",
+        ));
     }
     bytes.push(b'\n');
     writer.write_all(&bytes)?;
-    writer.flush()?;
-    Ok(())
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -248,10 +230,17 @@ mod tests {
 
     use super::*;
 
+    const MEM: u64 = 64 << 30;
+
+    fn bad(bytes: &[u8]) -> (ErrorCode, String) {
+        parse_request(bytes, MEM).unwrap_err()
+    }
+
     #[test]
     fn parses_the_design_admit_example() {
         let request = parse_request(
             br#"{"v":1,"op":"admit","unit":"slicewise-batch-4711-1.service","class":"batch","mem_hint":3221225472,"jobs_hint":8,"queue":true}"#,
+            MEM,
         )
         .unwrap();
         assert_eq!(
@@ -269,18 +258,21 @@ mod tests {
 
     #[test]
     fn queue_defaults_to_true_and_status_and_explain_parse() {
-        let request =
-            parse_request(br#"{"v":1,"op":"admit","unit":"a.service","class":"normal"}"#).unwrap();
+        let request = parse_request(
+            br#"{"v":1,"op":"admit","unit":"a.service","class":"normal"}"#,
+            MEM,
+        )
+        .unwrap();
         let Request::Admit { queue, .. } = request else {
             panic!("admit");
         };
         assert!(queue);
         assert_eq!(
-            parse_request(br#"{"v":1,"op":"status"}"#).unwrap(),
+            parse_request(br#"{"v":1,"op":"status"}"#, MEM).unwrap(),
             Request::Status { v: 1 }
         );
         assert_eq!(
-            parse_request(br#"{"v":1,"op":"explain","target":"batch"}"#).unwrap(),
+            parse_request(br#"{"v":1,"op":"explain","target":"batch"}"#, MEM).unwrap(),
             Request::Explain {
                 v: 1,
                 target: "batch".into()
@@ -289,59 +281,84 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_and_variants_are_rejected() {
-        let error = parse_request(br#"{"v":1,"op":"status","mystery":1}"#).unwrap_err();
-        assert!(matches!(error, ProtoError::BadRequest(_)));
-        assert!(error.to_string().contains("unknown field `mystery`"));
-
-        let error = parse_request(
-            br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","target":"x"}"#,
+    fn mem_hint_must_fit_mem_total() {
+        let (code, detail) = parse_request(
+            br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","mem_hint":18446744073709551615}"#,
+            1 << 30,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("unknown field `target`"));
+        assert_eq!(code, ErrorCode::BadRequest);
+        assert_eq!(
+            detail,
+            "mem_hint = 18446744073709551615: must be <= MemTotal 1073741824"
+        );
+    }
 
-        let error = parse_request(br#"{"v":1,"op":"dance"}"#).unwrap_err();
-        assert!(error.to_string().contains("unknown variant `dance`"));
+    #[test]
+    fn explain_target_is_a_unit_or_class() {
+        for target in ["interactive", "normal", "batch", "a.service"] {
+            let request = format!(r#"{{"v":1,"op":"explain","target":"{target}"}}"#);
+            assert!(parse_request(request.as_bytes(), MEM).is_ok(), "{target}");
+        }
+        let (code, detail) =
+            parse_request(br#"{"v":1,"op":"explain","target":"not a unit"}"#, MEM).unwrap_err();
+        assert_eq!(code, ErrorCode::BadRequest);
+        assert!(detail.contains("invalid unit name or class"), "{detail}");
+    }
 
-        let error = parse_request(br#"{"v":1,"op":"admit","unit":"a.service","class":"urgent"}"#)
-            .unwrap_err();
-        assert!(error.to_string().contains("unknown variant `urgent`"));
+    #[test]
+    fn unknown_fields_and_variants_are_rejected() {
+        let (code, detail) = bad(br#"{"v":1,"op":"status","mystery":1}"#);
+        assert_eq!(code, ErrorCode::BadRequest);
+        assert!(detail.contains("unknown field `mystery`"));
+
+        let (_, detail) =
+            bad(br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","target":"x"}"#);
+        assert!(detail.contains("unknown field `target`"));
+
+        let (_, detail) = bad(br#"{"v":1,"op":"dance"}"#);
+        assert!(detail.contains("unknown variant `dance`"));
+
+        let (_, detail) = bad(br#"{"v":1,"op":"admit","unit":"a.service","class":"urgent"}"#);
+        assert!(detail.contains("unknown variant `urgent`"));
     }
 
     #[test]
     fn bad_version_is_typed() {
-        let error = parse_request(br#"{"v":2,"op":"status"}"#).unwrap_err();
-        assert!(matches!(error, ProtoError::UnsupportedVersion(2)));
+        let (code, detail) = bad(br#"{"v":2,"op":"status"}"#);
+        assert_eq!(code, ErrorCode::UnsupportedVersion);
+        assert_eq!(detail, "v = 2");
     }
 
     #[test]
     fn field_validation_is_strict() {
-        let error = parse_request(br#"{"v":1,"op":"status","unit":"a.service"}"#).unwrap_err();
-        assert!(error.to_string().contains("unknown field `unit`"));
+        let (_, detail) = bad(br#"{"v":1,"op":"status","unit":"a.service"}"#);
+        assert!(detail.contains("unknown field `unit`"));
 
-        let error = parse_request(br#"{"v":1,"op":"admit","unit":"bad name","class":"batch"}"#)
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid systemd unit name"));
+        let (_, detail) = bad(br#"{"v":1,"op":"admit","unit":"bad name","class":"batch"}"#);
+        assert!(detail.contains("invalid systemd unit name"));
 
-        let error = parse_request(
-            br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","jobs_hint":4097}"#,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("must be <= 4096"));
+        let (_, detail) =
+            bad(br#"{"v":1,"op":"admit","unit":"a.service","class":"batch","jobs_hint":4097}"#);
+        assert!(detail.contains("must be <= 4096"));
     }
 
     #[test]
     fn read_one_stops_at_newline_and_enforces_the_size_limit() {
         let mut cursor = Cursor::new(b"{\"v\":1,\"op\":\"status\"}\n".to_vec());
-        assert_eq!(read_one(&mut cursor).unwrap(), Request::Status { v: 1 });
+        assert_eq!(
+            read_one(&mut cursor, MEM).unwrap(),
+            Request::Status { v: 1 }
+        );
 
         let mut oversized = vec![b'x'; MAX_MESSAGE + 1];
         oversized.push(b'\n');
-        let error = read_one(&mut Cursor::new(oversized)).unwrap_err();
-        assert!(matches!(error, ProtoError::TooLarge));
+        let (code, _) = read_one(&mut Cursor::new(oversized), MEM).unwrap_err();
+        assert_eq!(code, ErrorCode::TooLarge);
 
-        let error = read_one(&mut Cursor::new(Vec::new())).unwrap_err();
-        assert!(matches!(error, ProtoError::Io(_)));
+        let (code, detail) = read_one(&mut Cursor::new(Vec::new()), MEM).unwrap_err();
+        assert_eq!(code, ErrorCode::BadRequest);
+        assert_eq!(detail, "connection closed");
     }
 
     #[test]
@@ -365,5 +382,12 @@ mod tests {
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"], "bad_request");
         assert!(value.get("decision").is_none());
+    }
+
+    #[test]
+    fn response_tolerates_unknown_fields() {
+        let response: Response =
+            serde_json::from_slice(br#"{"v":1,"ok":true,"future":1}"#).unwrap();
+        assert_eq!(response, Response::new(true));
     }
 }
