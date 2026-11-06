@@ -375,7 +375,7 @@ fn admission(
 ) -> Admission {
     let need = request
         .mem_hint
-        .unwrap_or(config.classes.get(request.class).default_mem.0);
+        .unwrap_or(config.classes.default_mem(request.class).0);
     let headroom = headroom(snapshot, config);
     let reserved = state.outstanding(now);
     let available = headroom.saturating_sub(reserved);
