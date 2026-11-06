@@ -37,10 +37,6 @@ impl Runner {
         Self::new(Mode::Real)
     }
 
-    pub fn record() -> Self {
-        Self::new(Mode::Record)
-    }
-
     fn call(&self, args: &[&str]) -> Result<String, String> {
         if self.mode == Mode::Record {
             let argv = args.iter().map(|arg| (*arg).to_string()).collect();

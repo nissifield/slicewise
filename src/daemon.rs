@@ -89,8 +89,11 @@ impl Sampler {
         units: &[String],
     ) -> Snapshot {
         let root = self.paths.cgroup.clone();
-        if self.pool_rel.is_none() && now >= self.next_refresh {
+        let refresh = now >= self.next_refresh;
+        if refresh {
             self.next_refresh = now + REFRESH;
+        }
+        if self.pool_rel.is_none() && refresh {
             match runner.show(&config.pool_slice, "ControlGroup") {
                 Ok(rel) if !rel.is_empty() => self.pool_rel = Some(rel),
                 Ok(_) => {}
@@ -122,7 +125,7 @@ impl Sampler {
         }
         let mut protected_cpu_pressure = Vec::with_capacity(config.protected.len());
         for protected in &config.protected {
-            let psi = self.protected_psi(&root, runner, &protected.unit);
+            let psi = self.protected_psi(&root, runner, &protected.unit, refresh);
             protected_cpu_pressure.push(psi);
         }
         let mut map = BTreeMap::new();
@@ -141,8 +144,9 @@ impl Sampler {
         }
     }
 
-    fn protected_psi(&mut self, root: &Path, runner: &Runner, unit: &str) -> f32 {
-        if !self.protected_rel.contains_key(unit)
+    fn protected_psi(&mut self, root: &Path, runner: &Runner, unit: &str, refresh: bool) -> f32 {
+        if refresh
+            && !self.protected_rel.contains_key(unit)
             && let Ok(rel) = runner.show(unit, "ControlGroup")
             && !rel.is_empty()
         {
@@ -445,7 +449,7 @@ fn class_row(
 fn explain(
     daemon: &Daemon,
     config: &Config,
-    runner: &Runner,
+    class_hint: Option<Class>,
     target: &str,
     now: Duration,
 ) -> Explain {
@@ -462,7 +466,7 @@ fn explain(
                 .find(|event| event.unit.as_deref() == Some(target))
                 .and_then(|event| event.class)
         })
-        .or_else(|| unit_class(runner, config, target));
+        .or(class_hint);
     Explain {
         target: target.to_string(),
         class,
@@ -584,9 +588,11 @@ fn handle(stream: &UnixStream, shared: &Shared) -> io::Result<()> {
             proto::write_one(&mut out, &Response::status(status))
         }
         Request::Explain { target, .. } => {
+            // `show` spawns systemctl, so resolve the class before taking the lock.
+            let class_hint = unit_class(&shared.runner, &shared.config, &target);
             let explain = {
                 let daemon = lock(&shared.daemon);
-                explain(&daemon, &shared.config, &shared.runner, &target, now)
+                explain(&daemon, &shared.config, class_hint, &target, now)
             };
             let mut out = stream;
             proto::write_one(&mut out, &Response::explain(explain))
@@ -729,6 +735,8 @@ fn run_inner() -> Result<(), (u8, String)> {
             &shared.runner,
             shared.start.elapsed(),
         );
+        // Wake queued wrappers so an admission's second line goes out at once.
+        shared.wake.notify_all();
         let daemon = lock(&shared.daemon);
         if daemon.over_budget {
             drop(daemon);
