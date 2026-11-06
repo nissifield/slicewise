@@ -37,14 +37,6 @@ fn skip(test: &str) -> bool {
     false
 }
 
-fn user_unit_dir() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) => PathBuf::from(dir).join("systemd/user"),
-        None => PathBuf::from(std::env::var_os("HOME").expect("HOME unset"))
-            .join(".config/systemd/user"),
-    }
-}
-
 fn show(unit: &str, property: &str) -> String {
     slicewise::systemd::systemctl(&["--user", "show", "--value", "-p", property, unit])
         .unwrap_or_else(|error| panic!("show {property} for {unit}: {error}"))
@@ -147,7 +139,7 @@ impl Fixture {
         Self {
             pool,
             classes,
-            unit_dir: user_unit_dir(),
+            unit_dir: common::user_unit_dir(),
             rendered: common::TempDir::new("live-units"),
             config_home,
             runtime,

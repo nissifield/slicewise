@@ -42,14 +42,6 @@ fn generic(rel: &str) -> String {
     }
 }
 
-fn user_unit_dir() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) => PathBuf::from(dir).join("systemd/user"),
-        None => PathBuf::from(std::env::var_os("HOME").expect("HOME unset"))
-            .join(".config/systemd/user"),
-    }
-}
-
 fn find_program(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -116,7 +108,7 @@ impl SliceFixture {
             pool: format!("app-{stem}.slice"),
             class: format!("app-{stem}-batch.slice"),
             stem,
-            dir: user_unit_dir(),
+            dir: common::user_unit_dir(),
             files: Vec::new(),
             units: Vec::new(),
             tmp: common::TempDir::new("m0-live"),

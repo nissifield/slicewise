@@ -1,7 +1,7 @@
 //! Fake cgroupfs (design §10): daemon ticks over real file formats, with
 //! `systemd.rs` in `Record` or `Fail` mode, asserting the `set-property` argv.
 
-mod common;
+pub mod common;
 
 use std::fs;
 use std::path::Path;

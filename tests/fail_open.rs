@@ -2,7 +2,7 @@
 //! The child sees an env with only fake `systemctl`/`systemd-run` on `PATH`,
 //! so a mistake cannot reach the real systemd.
 
-mod common;
+pub mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
