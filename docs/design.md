@@ -106,16 +106,18 @@ static frame (unit files from `slicewise units`): pool slice, 3 class slices, sl
 |---|---|---|---|---|---|
 | protected | the orchestrator's own unit(s), named in config | 200 (drop-in) + `MemoryLow` | never touched at runtime; read for PSI only | n/a | inherited (lowest) |
 | interactive | `app-slicewise-interactive.slice` | 400 | never braked or clamped | always admit | inherited |
-| normal (default) | `app-slicewise-normal.slice` | 100 | braked second | always admit (logged if over budget) | +300 |
-| batch ("can wait") | `app-slicewise-batch.slice` | 25 | braked first; CPU clamped | queue if it doesn't fit | +800 |
+| normal (default) | `app-slicewise-normal.slice` | 100 | braked second | always admit (logged if over budget) | 300 |
+| batch ("can wait") | `app-slicewise-batch.slice` | 25 | braked first; CPU clamped | queue if it doesn't fit | 800 |
 
 The pool slice `app-slicewise.slice` (CPU weight 100) sits under `app.slice`. Configs where the orchestrator lives elsewhere can change this; the point is that the pool is a **sibling** of the orchestrator unit. cgroup weights only compete between siblings, so weight 200 against 100 gives the orchestrator at least ⅔ of contended CPU.
 
-Unprivileged processes can only **raise** `oom_score_adj`, so classes only ever go up from the inherited value. M0 verifies this.
+Unprivileged processes can only **raise** `oom_score_adj`, so classes only ever go up from the inherited value. The table values are absolute `OOMScoreAdjust=` settings and must stay above the inherited one. A lower request is not an error: systemd accepts it and reports it in `systemctl show`, but the kernel keeps the inherited value (M0). Only `/proc/<pid>/oom_score_adj` shows the value actually applied.
 
 ### 5.3 Knobs, and who writes them
 
 **Decision (Claude): systemd is the only writer. The daemon reads cgroupfs directly and writes only through `systemctl --user set-property --runtime`.** systemd owns these files and would overwrite direct writes on reload. The fork/exec cost (about 10 ms) does not matter at the bounded write rate of at most 3 slices × 1 write per 10 s. Every `systemctl` call has a 5 s deadline (spawn plus a `try_wait` loop), so a hung manager cannot freeze the loop.
+
+The only write outside systemd is the wrapper raising its own `oom_score_adj` for scopes. That is procfs, not cgroupfs, and raise-only; the daemon never writes procfs.
 
 | Knob | Set on | Static or dynamic | By |
 |---|---|---|---|
@@ -126,7 +128,7 @@ Unprivileged processes can only **raise** `oom_score_adj`, so classes only ever 
 | `memory.high` | pool (`pool_memory_max − margin`) | static | unit file |
 | `memory.high` | batch slice, then normal slice | **dynamic** (brake) | daemon `MemoryHigh=` |
 | `memory.low` | protected units | static | drop-in |
-| `oom_score_adj`, `memory.oom.group` | each task | launch-time | wrapper (`-p OOMScoreAdjust=`, `-p OOMPolicy=kill`) |
+| `oom_score_adj`, `memory.oom.group` | each task | launch-time | wrapper (`-p OOMScoreAdjust=` for services; its own `/proc/self/oom_score_adj` before `exec` for `--scope`; `-p OOMPolicy=kill`) |
 
 ### 5.4 Control loop
 
@@ -198,7 +200,7 @@ Live adjustment through a daemon-owned jobserver FIFO is in the backlog (§4).
 
 **Decision (Claude): revert to the static defaults.**
 
-- **Daemon crash, kill or stop.** `slicewise.service` has `ExecStopPost=slicewise reset`. `reset` runs `systemctl --user revert` on the class slices: it removes the runtime drop-ins and restores the unit-file values, which means no brake and no clamp. systemd runs `ExecStopPost` on failure too, then restarts the daemon (`Restart=on-failure`, `RestartSec=5`), which reconciles from cgroupfs. Workloads keep running throughout, and the hard limits never depended on the daemon.
+- **Daemon crash, kill or stop.** `slicewise.service` has `ExecStopPost=slicewise reset`. `reset` runs `systemctl --user revert` on the three class slices only, never the pool or protected units. It removes the runtime drop-ins and restores the unit-file values, which means no brake and no clamp (verified in M0). `reset` judges success by exit status alone; anything systemctl prints is informational. systemd runs `ExecStopPost` on failure too, then restarts the daemon (`Restart=on-failure`, `RestartSec=5`), which reconciles from cgroupfs. Workloads keep running throughout, and the hard limits never depended on the daemon.
 - **No daemon at launch.** The wrapper decides locally with no queue, prints `slicewise: daemon unreachable, launching with static defaults` to stderr, and execs. The orchestrator is never blocked by slicewise being absent.
 - **Daemon dies while a wrapper waits in the queue.** The wrapper sees end-of-file and launches with the warning above.
 - **Bad config.** The daemon exits with code 78. `ExecStopPost` reverts, wrappers fail open, and `slicewise check-config` shows the error.
@@ -218,7 +220,7 @@ slicewise check-config [PATH]
 slicewise units <DIR>           # write the static-frame unit files + protected drop-ins into DIR
 ```
 
-`run` adds `--user --slice=<class slice> -p OOMScoreAdjust=<n> -p OOMPolicy=kill`, one `--setenv=<VAR>=<jobs>` per `jobs_env` entry, and `--unit=slicewise-<class>-<pid>-<n>` if the caller gave no `--unit`. Everything else is passed to `systemd-run` verbatim as argv, never through a shell. That includes `--wait`, `--pipe`, `--scope` and `-p` properties.
+`run` adds `--user --slice=<class slice> -p OOMPolicy=kill`, one `--setenv=<VAR>=<jobs>` per `jobs_env` entry, and `--unit=slicewise-<class>-<pid>-<n>` if the caller gave no `--unit`. For a service it also adds `-p OOMScoreAdjust=<n>`. Scopes reject that property (M0). So when the `systemd-run` options before the command include `--scope`, `run` instead raises its own `/proc/self/oom_score_adj` to `<n>` before `exec`, and the scope inherits it. It only ever raises; if the write fails it warns on stderr and launches anyway. Everything else is passed to `systemd-run` verbatim as argv, never through a shell. That includes `--wait`, `--pipe`, `--scope` and `-p` properties.
 
 `run` refuses a caller-supplied `--slice`, `--system`, `-M` or `-H` with exit code 64. Its exit code is `systemd-run`'s, through `exec`, except 75 (`EX_TEMPFAIL`) for `--no-queue` when the work would queue, 64 for usage errors and 78 for config errors.
 

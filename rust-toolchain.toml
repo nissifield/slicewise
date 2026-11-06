@@ -1,5 +1,5 @@
 [toolchain]
 # 1.99.1 at the time of the spike; a bump is its own PR (design §11).
-channel = "stable"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 targets = ["x86_64-unknown-linux-musl"]
